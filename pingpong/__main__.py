@@ -73,6 +73,7 @@ from .models import (
     Assistant,
     Base,
     ExternalLogin,
+    LTIClass,
     Run,
     S3File,
     ScheduledJob,
@@ -1207,7 +1208,15 @@ async def _send_activity_summaries(
     show_default=True,
     help="Print the suggested values as JSON.",
 )
-def lti_suggest_config_from_db(json_output: bool) -> None:
+@click.option(
+    "--suppress-registration-prints/--show-registration-prints",
+    default=False,
+    show_default=True,
+    help="Hide per-registration source lines in text output.",
+)
+def lti_suggest_config_from_db(
+    json_output: bool, suppress_registration_prints: bool
+) -> None:
     """
     Suggest LTI config values based on existing DB registrations.
     """
@@ -1275,6 +1284,34 @@ def lti_suggest_config_from_db(json_output: bool) -> None:
                         f"{source_prefix}.openid_configuration.{key}",
                     )
 
+            memberships_result = await session.stream(
+                select(
+                    LTIClass.id,
+                    LTIClass.registration_id,
+                    LTIClass.context_memberships_url,
+                )
+                .join(LTIRegistration, LTIClass.registration_id == LTIRegistration.id)
+                .where(
+                    and_(
+                        LTIRegistration.enabled.is_(True),
+                        LTIRegistration.review_status
+                        == LTIRegistrationReviewStatus.APPROVED,
+                    )
+                )
+                .order_by(LTIClass.registration_id.asc(), LTIClass.id.asc())
+            )
+            async for lti_class in memberships_result:
+                _record_url(
+                    lti_class.context_memberships_url,
+                    (
+                        "registration["
+                        f"{lti_class.registration_id}"
+                        "].lti_classes["
+                        f"{lti_class.id}"
+                        "].context_memberships_url"
+                    ),
+                )
+
         suggested_hosts = sorted(hosts_to_sources.keys())
         suggested_config = {
             "lti": {
@@ -1316,8 +1353,9 @@ def lti_suggest_config_from_db(json_output: bool) -> None:
         )
         for host in suggested_hosts:
             click.echo(f"# {host}")
-            for source in sorted(hosts_to_sources[host]):
-                click.echo(f"#   - {source}")
+            if not suppress_registration_prints:
+                for source in sorted(hosts_to_sources[host]):
+                    click.echo(f"#   - {source}")
         if warnings:
             click.echo("")
             click.echo("# Warnings")
