@@ -12,7 +12,11 @@
 	export let data;
 
 	onMount(() => {
-		detectBrowser();
+		try {
+			detectBrowser();
+		} finally {
+			document.getElementById('loading-screen')?.remove();
+		}
 	});
 
 	$: showSidebar =
