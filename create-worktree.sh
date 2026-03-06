@@ -18,27 +18,214 @@ if [[ ${#MISSING_TOOLS[@]} -gt 0 ]]; then
   exit 1
 fi
 
-if [[ -z "${1:-}" ]]; then
-  echo "Usage: $0 <branch-and-worktree-name>" >&2
-  exit 1
-fi
+TYPE_OPTIONS=(feat change chore fix)
 
-# Validate worktree name: allow alphanumeric, hyphens, underscores, and slashes for nested branches
-if [[ ! "$1" =~ ^[a-zA-Z0-9][a-zA-Z0-9_/-]*$ ]]; then
-  echo "ERROR: Invalid worktree name '$1'" >&2
-  echo "Names must start with alphanumeric and contain only letters, numbers, hyphens, underscores, or slashes." >&2
-  exit 1
-fi
+resolve_repo_root() {
+  git rev-parse --show-toplevel 2>/dev/null || {
+    echo "ERROR: create-worktree.sh must be run from within a git checkout." >&2
+    exit 1
+  }
+}
 
-# Reject path traversal attempts and consecutive slashes
-if [[ "$1" == *".."* ]] || [[ "$1" == *"//"* ]] || [[ "$1" == */ ]]; then
-  echo "ERROR: Invalid worktree name '$1' (contains '..' or invalid slashes)" >&2
-  exit 1
-fi
+resolve_shared_worktree_root() {
+  local git_common_dir
+  local main_repo_root
+  local repo_parent
+  local repo_name
 
-BRANCH_NAME="$1"
-WORKTREE_NAME="$1"
-WORKTREE_ROOT="../pingpong-worktrees"
+  git_common_dir="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || {
+    echo "ERROR: Could not determine the shared git directory." >&2
+    exit 1
+  }
+
+  main_repo_root="$(cd "${git_common_dir}/.." && pwd -P)" || exit 1
+  repo_parent="$(dirname "${main_repo_root}")"
+  repo_name="$(basename "${main_repo_root}")"
+  echo "${repo_parent}/${repo_name}-worktrees"
+}
+
+usage() {
+  echo "Usage:" >&2
+  echo "  $0                     # prompt for branch type and name" >&2
+  echo "  $0 <name>              # prompt for branch type" >&2
+  echo "  $0 <type> <name>       # create <github-user>/<type>/<name>" >&2
+  echo "  $0 <user> <type> <name>" >&2
+  echo "  $0 <user>/<type>/<name>" >&2
+}
+
+is_valid_worktree_name() {
+  local value="$1"
+  [[ "${value}" =~ ^[a-zA-Z0-9][a-zA-Z0-9_/-]*$ ]] \
+    && [[ "${value}" != *".."* ]] \
+    && [[ "${value}" != *"//"* ]] \
+    && [[ "${value}" != */ ]]
+}
+
+require_valid_worktree_name() {
+  local value="$1"
+  if ! is_valid_worktree_name "${value}"; then
+    echo "ERROR: Invalid worktree name '${value}'" >&2
+    echo "Names must start with alphanumeric and contain only letters, numbers, hyphens, underscores, or slashes." >&2
+    echo "Names cannot contain '..', consecutive slashes, or end with a slash." >&2
+    exit 1
+  fi
+}
+
+is_valid_branch_type() {
+  local type="$1"
+  for option in "${TYPE_OPTIONS[@]}"; do
+    if [[ "${type}" == "${option}" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+require_valid_branch_type() {
+  local type="$1"
+  if ! is_valid_branch_type "${type}"; then
+    echo "ERROR: Invalid branch type '${type}'." >&2
+    echo "Allowed types: ${TYPE_OPTIONS[*]}" >&2
+    exit 1
+  fi
+}
+
+prompt_branch_type() {
+  local branch_type
+  while true; do
+    read -r -p "Branch type [feat/change/chore/fix]: " branch_type
+    if is_valid_branch_type "${branch_type}"; then
+      echo "${branch_type}"
+      return 0
+    fi
+    echo "Please enter one of: ${TYPE_OPTIONS[*]}" >&2
+  done
+}
+
+prompt_branch_name() {
+  local branch_name
+  while true; do
+    read -r -p "Branch name: " branch_name
+    if ! is_valid_worktree_name "${branch_name}"; then
+      echo "Names must start with alphanumeric and contain only letters, numbers, hyphens, or underscores." >&2
+      echo "Names cannot contain '..', slashes, consecutive slashes, or end with a slash." >&2
+      continue
+    fi
+    if [[ "${branch_name}" == *"/"* ]]; then
+      echo "ERROR: Branch name must be a single path segment. Use hyphens or underscores instead of '/'." >&2
+      continue
+    fi
+    echo "${branch_name}"
+    return 0
+  done
+}
+
+resolve_github_username() {
+  local username=""
+
+  username="${GITHUB_USERNAME:-}"
+  if [[ -n "${username}" ]]; then
+    echo "${username}"
+    return 0
+  fi
+
+  for key in github.user github.username user.github; do
+    username="$(git config --get "${key}" 2>/dev/null || true)"
+    if [[ -n "${username}" ]]; then
+      echo "${username}"
+      return 0
+    fi
+  done
+
+  if command -v gh >/dev/null 2>&1; then
+    username="$(gh api user -q .login 2>/dev/null || true)"
+    if [[ -n "${username}" ]]; then
+      echo "${username}"
+      return 0
+    fi
+  fi
+
+  echo "ERROR: Could not determine GitHub username." >&2
+  echo "Set one of git config keys 'github.user', 'github.username', or 'user.github', export GITHUB_USERNAME, or authenticate with gh." >&2
+  exit 1
+}
+
+build_branch_name() {
+  local username="$1"
+  local branch_type="$2"
+  local branch_name="$3"
+  echo "${username}/${branch_type}/${branch_name}"
+}
+
+build_worktree_name() {
+  local username="$1"
+  local branch_type="$2"
+  local branch_name="$3"
+  echo "${username}_${branch_type}_${branch_name}"
+}
+
+parse_branch_input() {
+  local username=""
+  local branch_type=""
+  local branch_name=""
+
+  case "$#" in
+    0)
+      username="$(resolve_github_username)"
+      branch_type="$(prompt_branch_type)"
+      branch_name="$(prompt_branch_name)"
+      ;;
+    1)
+      if [[ "${1}" == */* ]]; then
+        require_valid_worktree_name "${1}"
+        IFS='/' read -r username branch_type branch_name extra <<< "${1}"
+        if [[ -n "${extra:-}" || -z "${username}" || -z "${branch_type}" || -z "${branch_name}" ]]; then
+          echo "ERROR: Expected branch name in the form <user>/<type>/<name>." >&2
+          exit 1
+        fi
+      else
+        username="$(resolve_github_username)"
+        branch_type="$(prompt_branch_type)"
+        branch_name="${1}"
+      fi
+      ;;
+    2)
+      username="$(resolve_github_username)"
+      branch_type="${1}"
+      branch_name="${2}"
+      ;;
+    3)
+      username="${1}"
+      branch_type="${2}"
+      branch_name="${3}"
+      ;;
+    *)
+      usage
+      exit 1
+      ;;
+  esac
+
+  require_valid_worktree_name "${username}"
+  if [[ "${username}" == *"/"* ]]; then
+    echo "ERROR: GitHub username must be a single path segment." >&2
+    exit 1
+  fi
+
+  require_valid_branch_type "${branch_type}"
+  require_valid_worktree_name "${branch_name}"
+  if [[ "${branch_name}" == *"/"* ]]; then
+    echo "ERROR: Branch name must be a single path segment. Use hyphens or underscores instead of '/'." >&2
+    exit 1
+  fi
+
+  BRANCH_NAME="$(build_branch_name "${username}" "${branch_type}" "${branch_name}")"
+  WORKTREE_NAME="$(build_worktree_name "${username}" "${branch_type}" "${branch_name}")"
+}
+
+parse_branch_input "$@"
+
+REPO_ROOT="$(resolve_repo_root)"
+WORKTREE_ROOT="$(resolve_shared_worktree_root)"
 PORTS_FILE="${WORKTREE_ROOT}/.worktree-ports.json"
 
 sanitize_db_suffix() {
@@ -69,12 +256,12 @@ sanitize_db_suffix() {
 }
 
 DB_SUFFIX="$(sanitize_db_suffix "${BRANCH_NAME}")"
-WORKTREE_PATH="${WORKTREE_ROOT}/${DB_SUFFIX}"
+WORKTREE_PATH="${WORKTREE_ROOT}/${WORKTREE_NAME}"
 DB_NAME="pingpong_${DB_SUFFIX}"
 AUTHZ_STORE_NAME="pingpong_${DB_SUFFIX}"
 
 # Parse authz settings from config file
-CONFIG_FILE="${CONFIG_FILE:-config.local.toml}"
+CONFIG_FILE="${CONFIG_FILE:-${REPO_ROOT}/config.local.toml}"
 if [[ ! -f "${CONFIG_FILE}" ]]; then
   echo "ERROR: Config file not found: ${CONFIG_FILE}" >&2
   exit 1
@@ -105,7 +292,7 @@ AUTHZ_HOST="$(get_toml_value "${CONFIG_FILE}" "authz" "host" "localhost")"
 AUTHZ_TOKEN="$(get_toml_value "${CONFIG_FILE}" "authz" "key" "devkey")"
 
 # Get authz port from docker-compose.yml (first port in authz service ports mapping)
-DOCKER_COMPOSE_FILE="${DOCKER_COMPOSE_FILE:-docker-compose.yml}"
+DOCKER_COMPOSE_FILE="${DOCKER_COMPOSE_FILE:-${REPO_ROOT}/docker-compose.yml}"
 if [[ -f "${DOCKER_COMPOSE_FILE}" ]]; then
   AUTHZ_PORT="$(awk '/^  authz:/,/^  [a-z]/' "${DOCKER_COMPOSE_FILE}" | grep -E '^\s+ports:' | grep -oE '"[0-9]+:' | head -1 | tr -d '":' || echo "8080")"
   [[ -z "${AUTHZ_PORT}" ]] && AUTHZ_PORT="8080"
@@ -182,6 +369,86 @@ get_store_id_by_name() {
   authz_api "${AUTHZ_API}/stores" | jq -r --arg name "${name}" '.stores[] | select(.name == $name) | .id'
 }
 
+get_worktree_path_for_name() {
+  local worktree_name="$1"
+  local target_path
+
+  target_path="${WORKTREE_ROOT}/${worktree_name}"
+  git worktree list --porcelain 2>/dev/null | awk -v target="${target_path}" '
+    $1 == "worktree" {
+      path = $0
+      sub(/^worktree /, "", path)
+    }
+    $1 == "branch" {
+      if (path == target) {
+        print path
+        exit
+      }
+    }
+  '
+}
+
+get_worktree_path_for_branch() {
+  local branch_name="$1"
+  git worktree list --porcelain 2>/dev/null | awk -v branch="refs/heads/${branch_name}" '
+    $1 == "worktree" {
+      path = $0
+      sub(/^worktree /, "", path)
+    }
+    $1 == "branch" && $2 == branch {
+      print path
+      exit
+    }
+  '
+}
+
+get_branch_for_worktree_name() {
+  local worktree_name="$1"
+  local target_path
+
+  target_path="${WORKTREE_ROOT}/${worktree_name}"
+  git worktree list --porcelain 2>/dev/null | awk -v target="${target_path}" '
+    $1 == "worktree" {
+      path = $0
+      sub(/^worktree /, "", path)
+    }
+    $1 == "branch" {
+      branch = $2
+      sub(/^refs\/heads\//, "", branch)
+      if (path == target) {
+        print branch
+        exit
+      }
+    }
+  '
+}
+
+get_reserved_branch_for_worktree_name() {
+  local worktree_name="$1"
+  if [[ ! -f "${PORTS_FILE}" ]]; then
+    return 0
+  fi
+
+  jq -r --arg name "${worktree_name}" '.[$name].branch // empty' "${PORTS_FILE}" 2>/dev/null
+}
+
+report_worktree_name_collision() {
+  local owner_branch="$1"
+  local source="$2"
+
+  echo "ERROR: Worktree name '${WORKTREE_NAME}' is already in use." >&2
+  if [[ -n "${owner_branch}" ]]; then
+    echo "Branch '${BRANCH_NAME}' would collide with existing branch '${owner_branch}'." >&2
+  else
+    echo "Branch '${BRANCH_NAME}' would collide with another worktree using the same derived worktree name." >&2
+  fi
+  echo "Shared worktree path: ${WORKTREE_PATH}" >&2
+  if [[ -n "${source}" ]]; then
+    echo "Conflict source: ${source}" >&2
+  fi
+  echo "Remove the existing worktree with ./remove-worktree.sh <full-branch-name>, or choose a different branch name." >&2
+}
+
 ensure_container_running() {
   local container_name="$1"
   local max_attempts=30
@@ -227,12 +494,25 @@ wait_for_db_ready() {
 wait_for_authz_ready() {
   local max_attempts=30
   local attempt=1
+  local response=""
 
-  until docker exec pingpong-authz /usr/local/bin/grpc_health_probe -addr=authz:8081 >/dev/null 2>&1; do
+  while true; do
+    response="$(authz_api "${AUTHZ_API}/stores" 2>/dev/null || true)"
+    if [[ -n "${response}" ]] && echo "${response}" | jq -e '.stores' >/dev/null 2>&1; then
+      return 0
+    fi
+
     if (( attempt >= max_attempts )); then
-      echo "Authz server is not ready. Please run ./start-dev-docker.sh first." >&2
+      echo "Authz API is not ready after ${max_attempts} attempts." >&2
+      echo "Recent pingpong-authz logs:" >&2
+      docker logs --tail 20 pingpong-authz >&2 || true
       exit 1
     fi
+
+    if (( attempt == 1 || attempt % 5 == 0 )); then
+      echo "Waiting for authz API to become ready (attempt ${attempt}/${max_attempts})..."
+    fi
+
     attempt=$((attempt + 1))
     sleep 1
   done
@@ -449,11 +729,17 @@ rm -rf "${WORKDIR}"
 echo "Created authz store ${AUTHZ_STORE_NAME} (${NEW_STORE_ID})"
 
 if [[ -e "${WORKTREE_PATH}" ]]; then
-  echo "ERROR: Worktree path already exists: ${WORKTREE_PATH}" >&2
+  existing_branch="$(get_branch_for_worktree_name "${WORKTREE_NAME}")"
+  if [[ -n "${existing_branch}" && "${existing_branch}" != "${BRANCH_NAME}" ]]; then
+    report_worktree_name_collision "${existing_branch}" "existing worktree path"
+  else
+    echo "ERROR: Worktree path already exists: ${WORKTREE_PATH}" >&2
+  fi
   exit 1
 fi
 
 mkdir -p "${WORKTREE_ROOT}"
+mkdir -p "$(dirname "${WORKTREE_PATH}")"
 
 if git show-ref --verify --quiet "refs/heads/${BRANCH_NAME}"; then
   git worktree add "${WORKTREE_PATH}" "${BRANCH_NAME}"
@@ -532,20 +818,6 @@ release_ports_lock() {
   fi
 }
 
-get_worktree_path_for_branch() {
-  local branch_name="$1"
-  git worktree list --porcelain 2>/dev/null | awk -v branch="refs/heads/${branch_name}" '
-    $1 == "worktree" {
-      path = $0
-      sub(/^worktree /, "", path)
-    }
-    $1 == "branch" && $2 == branch {
-      print path
-      exit
-    }
-  '
-}
-
 # Clean up stale port reservations for non-existent worktrees
 cleanup_stale_reservations() {
   ensure_ports_file
@@ -558,12 +830,17 @@ cleanup_stale_reservations() {
   worktrees=$(jq -r 'keys[]' "${PORTS_FILE}" 2>/dev/null) || return 0
 
   for worktree in ${worktrees}; do
-    local legacy_worktree_path="${WORKTREE_ROOT}/${worktree}"
+    local worktree_path="${WORKTREE_ROOT}/${worktree}"
     local sanitized_worktree_path="${WORKTREE_ROOT}/$(sanitize_db_suffix "${worktree}")"
     local registered_worktree_path
+    local legacy_registered_worktree_path
 
-    registered_worktree_path="$(get_worktree_path_for_branch "${worktree}")"
-    if [[ -d "${legacy_worktree_path}" ]] || [[ -d "${sanitized_worktree_path}" ]] || [[ -n "${registered_worktree_path}" ]]; then
+    registered_worktree_path="$(get_worktree_path_for_name "${worktree}")"
+    legacy_registered_worktree_path="$(get_worktree_path_for_branch "${worktree}")"
+    if [[ -d "${worktree_path}" ]] \
+      || [[ -d "${sanitized_worktree_path}" ]] \
+      || [[ -n "${registered_worktree_path}" ]] \
+      || [[ -n "${legacy_registered_worktree_path}" ]]; then
       continue
     fi
 
@@ -597,6 +874,7 @@ reserve_ports() {
   local worktree="$1"
   local server="$2"
   local frontend="$3"
+  local branch_name="$4"
   local tmp_ports
 
   ensure_ports_file
@@ -604,7 +882,8 @@ reserve_ports() {
   if jq --arg name "${worktree}" \
        --argjson server "${server}" \
        --argjson frontend "${frontend}" \
-       '. + {($name): {server: $server, frontend: $frontend, updated_at: (now | todateiso8601)}}' \
+       --arg branch "${branch_name}" \
+       '. + {($name): {branch: $branch, server: $server, frontend: $frontend, updated_at: (now | todateiso8601)}}' \
        "${PORTS_FILE}" > "${tmp_ports}"; then
     if mv "${tmp_ports}" "${PORTS_FILE}"; then
       return 0
@@ -666,8 +945,16 @@ cleanup_stale_reservations
 
 ensure_ports_file
 if jq -e --arg name "${WORKTREE_NAME}" 'has($name)' "${PORTS_FILE}" >/dev/null 2>&1; then
-  echo "ERROR: Port reservation for ${WORKTREE_NAME} already exists in ${PORTS_FILE}." >&2
-  echo "Run ./remove-worktree.sh ${WORKTREE_NAME} or remove the entry manually." >&2
+  existing_reserved_branch="$(get_reserved_branch_for_worktree_name "${WORKTREE_NAME}")"
+  if [[ -z "${existing_reserved_branch}" ]]; then
+    existing_reserved_branch="$(get_branch_for_worktree_name "${WORKTREE_NAME}")"
+  fi
+  if [[ -n "${existing_reserved_branch}" && "${existing_reserved_branch}" != "${BRANCH_NAME}" ]]; then
+    report_worktree_name_collision "${existing_reserved_branch}" "port reservation in ${PORTS_FILE}"
+  else
+    echo "ERROR: Port reservation for worktree name '${WORKTREE_NAME}' already exists in ${PORTS_FILE}." >&2
+    echo "Run ./remove-worktree.sh ${WORKTREE_NAME} or remove the entry manually." >&2
+  fi
   exit 1
 fi
 
@@ -677,7 +964,7 @@ FRONTEND_PORT="$(find_next_available_port 5174)"
 export SERVER_PORT
 export FRONTEND_PORT
 
-if ! reserve_ports "${WORKTREE_NAME}" "${SERVER_PORT}" "${FRONTEND_PORT}"; then
+if ! reserve_ports "${WORKTREE_NAME}" "${SERVER_PORT}" "${FRONTEND_PORT}" "${BRANCH_NAME}"; then
   echo "ERROR: Failed to reserve ports for ${WORKTREE_NAME}." >&2
   exit 1
 fi
