@@ -1241,7 +1241,8 @@
 		instructionsPreview = '';
 
 		const result = await api.previewAssistantInstructions(fetch, data.class.id, {
-			instructions
+			instructions,
+			use_latex: useLatex
 		});
 		const expanded = api.expandResponse(result);
 
@@ -1797,10 +1798,14 @@
 			</div>
 			<div class="col-span-2 mb-4">
 				{#if interactionMode === 'chat'}
-					<Checkbox id="use_latex" name="use_latex" disabled={preventEdits} checked={useLatex}
-						>Use LaTeX</Checkbox
+					<Checkbox id="use_latex" name="use_latex" disabled={preventEdits} bind:checked={useLatex}
+						>Use LaTeX and other markup</Checkbox
 					>
-					<Helper>Enable LaTeX formatting for assistant responses.</Helper>
+					<Helper
+						>Enable LaTeX formatting and other advanced features like Mermaid diagrams for assistant
+						responses. Your prompt will be enhanced with additional instructions for handling these
+						features. Click "Preview" to see the full prompt.</Helper
+					>
 				{:else}
 					<div class="flex flex-col gap-y-1">
 						<Badge
