@@ -1,4 +1,4 @@
-import { Marked, type MarkedExtension } from 'marked';
+import { Marked, type MarkedExtension, type TokensList } from 'marked';
 import { markedHighlight } from 'marked-highlight';
 import { markedKatex } from './marked-katex';
 import hljs from 'highlight.js';
@@ -33,21 +33,27 @@ const DEFAULT_OPTIONS: MarkdownRendererOptions = {
 	syntax: true
 };
 
+const validateMarkdownRendererOptions = (options: MarkdownRendererOptions) => {
+	for (const key of Object.keys(options)) {
+		if (!(key in EXTENSIONS)) {
+			throw new Error(`Unknown markdown extension: ${key}`);
+		}
+	}
+};
+
 /**
  * Get a markdown renderer instance.
  */
 const getMarkdownRenderer = (options: MarkdownRendererOptions) => {
 	// Build list of enabled extensions
 	const extensions: MarkedExtension[] = [];
-	for (const [key, enabled] of Object.entries(options)) {
-		if (enabled) {
-			const ext = EXTENSIONS[key as keyof typeof EXTENSIONS];
-			if (!ext) {
-				throw new Error(`Unknown markdown extension: ${key}`);
-			}
-			extensions.push(ext);
-		}
+	if (options.syntax) {
+		extensions.push(EXTENSIONS.syntax);
 	}
+	if (options.latex) {
+		extensions.push(EXTENSIONS.latex);
+	}
+
 	return new Marked(...extensions);
 };
 
@@ -78,6 +84,21 @@ const getCachedRenderer = memoize(getMarkdownRenderer, keyFromOpts);
  */
 export const markdown = (str: string, options?: MarkdownRendererOptions) => {
 	const fullOpts = { ...DEFAULT_OPTIONS, ...(options || {}) };
+	validateMarkdownRendererOptions(fullOpts);
 	const renderer = getCachedRenderer(fullOpts);
 	return renderer.parse(str);
+};
+
+export const lexMarkdown = (str: string, options?: MarkdownRendererOptions) => {
+	const fullOpts = { ...DEFAULT_OPTIONS, ...(options || {}) };
+	validateMarkdownRendererOptions(fullOpts);
+	const renderer = getCachedRenderer(fullOpts);
+	return renderer.lexer(str);
+};
+
+export const renderMarkdownTokens = (tokens: TokensList, options?: MarkdownRendererOptions) => {
+	const fullOpts = { ...DEFAULT_OPTIONS, ...(options || {}) };
+	validateMarkdownRendererOptions(fullOpts);
+	const renderer = getCachedRenderer(fullOpts);
+	return renderer.parser(tokens);
 };

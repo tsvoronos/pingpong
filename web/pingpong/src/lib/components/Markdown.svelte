@@ -1,10 +1,11 @@
 <script lang="ts">
-	import { afterUpdate, onDestroy, tick } from 'svelte';
-	import { mount, unmount } from 'svelte';
-	import { markdown } from '$lib/markdown';
+	import { afterUpdate, mount, onDestroy, tick, unmount } from 'svelte';
 	import type { InlineWebSource } from '$lib/content';
+	import { parseMarkdownSegments, type MarkdownSegment } from '$lib/markdown-segments';
 	import MermaidDiagram from './MermaidDiagram.svelte';
+	import MermaidStreaming from './MermaidStreaming.svelte';
 	import Sanitize from './Sanitize.svelte';
+	import SvgDiagram from './SvgDiagram.svelte';
 	import WebSourceChip from './WebSourceChip.svelte';
 	import 'katex/dist/katex.min.css';
 
@@ -13,22 +14,35 @@
 	export let latex = false;
 	export let inlineWebSources: InlineWebSource[] = [];
 
-	type MountedMermaidComponent = ReturnType<typeof mount>;
-
 	let container: HTMLDivElement;
 	let mountedChips: WebSourceChip[] = [];
-	let mountedMermaidDiagrams: { target: HTMLElement; component: MountedMermaidComponent }[] = [];
+	let mountedDiagrams: Array<{ component: object; placeholderId: string }> = [];
+	let wrappedDiagramMountVersion = 0;
+
+	$: segments = parseMarkdownSegments(content, { syntax, latex });
+	$: wrappedDiagramSignature = JSON.stringify(
+		segments
+			.filter(
+				(segment): segment is Extract<MarkdownSegment, { type: 'wrapped-diagram' }> =>
+					segment.type === 'wrapped-diagram'
+			)
+			.map((segment) => ({
+				placeholderId: segment.placeholderId,
+				type: segment.diagram.type,
+				source: segment.diagram.source
+			}))
+	);
+	let mountedWrappedDiagramSignature = '';
 
 	const destroyInlineWebSources = () => {
 		mountedChips.forEach((chip) => chip.$destroy());
 		mountedChips = [];
 	};
 
-	const destroyMermaidDiagrams = () => {
-		mountedMermaidDiagrams.forEach(({ component }) => {
-			void unmount(component);
-		});
-		mountedMermaidDiagrams = [];
+	const destroyMountedDiagrams = async () => {
+		const mounted = mountedDiagrams;
+		mountedDiagrams = [];
+		await Promise.all(mounted.map(({ component }) => unmount(component)));
 	};
 
 	// Replace placeholder spans from parseTextContent with live WebSourceChip instances.
@@ -67,53 +81,98 @@
 		});
 	};
 
-	const mountMermaidDiagrams = async () => {
-		if (!container) {
+	const mountWrappedDiagrams = async () => {
+		const mountVersion = ++wrappedDiagramMountVersion;
+		if (wrappedDiagramSignature === mountedWrappedDiagramSignature) {
 			return;
 		}
 
-		mountedMermaidDiagrams = mountedMermaidDiagrams.filter(({ target, component }) => {
-			const stillMounted = target.isConnected && container.contains(target);
-			if (!stillMounted) {
-				void unmount(component);
+		if (!container) {
+			await destroyMountedDiagrams();
+			mountedWrappedDiagramSignature = '';
+			return;
+		}
+
+		await destroyMountedDiagrams();
+		if (mountVersion !== wrappedDiagramMountVersion) {
+			return;
+		}
+
+		await tick();
+		if (!container || mountVersion !== wrappedDiagramMountVersion) {
+			return;
+		}
+
+		const wrappedDiagramSegments = segments.filter(
+			(segment): segment is Extract<MarkdownSegment, { type: 'wrapped-diagram' }> =>
+				segment.type === 'wrapped-diagram'
+		);
+
+		if (!wrappedDiagramSegments.length) {
+			mountedWrappedDiagramSignature = wrappedDiagramSignature;
+			return;
+		}
+
+		for (const segment of wrappedDiagramSegments) {
+			const placeholder = container.querySelector(
+				`[data-markdown-diagram-placeholder="${segment.placeholderId}"]`
+			);
+			if (!(placeholder instanceof HTMLElement) || mountVersion !== wrappedDiagramMountVersion) {
+				continue;
 			}
-			return stillMounted;
-		});
 
-		const mermaidBlocks = [
-			...container.querySelectorAll<HTMLElement>('pre > code.language-mermaid')
-		];
-		mermaidBlocks.forEach((block) => {
-			const pre = block.parentElement;
-			const source = block.textContent?.trim();
-			if (!pre || !source) {
-				return;
-			}
+			const component =
+				segment.diagram.type === 'svg-complete' || segment.diagram.type === 'svg-streaming'
+					? mount(SvgDiagram, {
+							target: placeholder,
+							props: {
+								source: segment.diagram.source,
+								isClosed: segment.diagram.type === 'svg-complete'
+							}
+						})
+					: segment.diagram.type === 'mermaid-streaming'
+						? mount(MermaidStreaming, {
+								target: placeholder,
+								props: { source: segment.diagram.source }
+							})
+						: mount(MermaidDiagram, {
+								target: placeholder,
+								props: { source: segment.diagram.source }
+							});
 
-			const target = document.createElement('div');
-			target.className = 'mb-4 overflow-hidden';
-			pre.replaceWith(target);
+			mountedDiagrams.push({ component, placeholderId: segment.placeholderId });
+		}
 
-			const component = mount(MermaidDiagram, {
-				target,
-				props: { source }
-			}) as MountedMermaidComponent;
-
-			mountedMermaidDiagrams.push({ target, component });
-		});
+		if (mountVersion === wrappedDiagramMountVersion) {
+			mountedWrappedDiagramSignature = wrappedDiagramSignature;
+		}
 	};
 
 	afterUpdate(() => {
 		mountInlineWebSources();
-		mountMermaidDiagrams();
+		mountWrappedDiagrams();
 	});
 
 	onDestroy(() => {
+		wrappedDiagramMountVersion += 1;
+		mountedWrappedDiagramSignature = '';
 		destroyInlineWebSources();
-		destroyMermaidDiagrams();
+		void destroyMountedDiagrams();
 	});
 </script>
 
 <div class="markdown max-w-full" bind:this={container}>
-	<Sanitize html={markdown(content, { syntax, latex })} />
+	{#each segments as segment, index (index)}
+		{#if segment.type === 'html'}
+			<Sanitize html={segment.content} />
+		{:else if segment.type === 'wrapped-diagram'}
+			<Sanitize html={segment.content} />
+		{:else if segment.type === 'mermaid-complete'}
+			<MermaidDiagram source={segment.source} />
+		{:else if segment.type === 'svg-complete' || segment.type === 'svg-streaming'}
+			<SvgDiagram source={segment.source} isClosed={segment.type === 'svg-complete'} />
+		{:else if segment.type === 'mermaid-streaming'}
+			<MermaidStreaming source={segment.source} />
+		{/if}
+	{/each}
 </div>
