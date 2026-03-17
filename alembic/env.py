@@ -1,14 +1,11 @@
 import base64
 from logging.config import fileConfig
-import json
 import os
 from pathlib import Path
-import re
-import subprocess
 import tomllib
 
 from sqlalchemy import engine_from_config, pool
-from sqlalchemy.engine import make_url
+from sqlalchemy.engine import URL
 
 from alembic import context
 from pingpong.models import Base
@@ -35,90 +32,110 @@ target_metadata = Base.metadata
 # ... etc.
 
 
-def _sanitize_db_suffix(raw: str) -> str:
-    cleaned = re.sub(r"[^a-z0-9_]+", "_", raw.lower()).strip("_")
-    if not cleaned:
-        cleaned = "branch"
-    if cleaned[0].isdigit():
-        cleaned = f"b_{cleaned}"
-    cleaned = cleaned[:40].rstrip("_")
-    return cleaned or "branch"
+_DEV_CONFIG_FILENAMES = (
+    "config.local.toml",
+    "config.dev.toml",
+    "config.toml",
+)
 
 
-def _is_development_config() -> bool:
-    raw_config = os.environ.get("CONFIG")
-    if raw_config:
-        try:
-            config_data = tomllib.loads(base64.b64decode(raw_config).decode("utf-8"))
-        except Exception:
-            return False
+def _load_config_data() -> dict[str, object] | None:
+    config_path_env = os.environ.get("CONFIG_PATH")
+    if config_path_env:
+        config_data = tomllib.loads(Path(config_path_env).read_text())
     else:
-        config_path = Path(os.environ.get("CONFIG_PATH", "config.toml"))
-        try:
-            config_data = tomllib.loads(config_path.read_text())
-        except Exception:
-            return False
+        raw_config = os.environ.get("CONFIG")
+        if raw_config:
+            config_data = tomllib.loads(base64.b64decode(raw_config).decode("utf-8"))
+        else:
+            config_data = None
+            for filename in _DEV_CONFIG_FILENAMES:
+                config_path = Path(filename)
+                if config_path.is_file():
+                    config_data = tomllib.loads(config_path.read_text())
+                    break
+
+    if config_data is None:
+        return None
 
     if not isinstance(config_data, dict):
-        return False
+        raise ValueError("Config root must be a TOML object")
+    return config_data
+
+
+def _is_development_config(config_data: dict[str, object]) -> bool:
     return bool(config_data.get("development", False))
 
 
-def _resolve_worktree_branch_name() -> str | None:
-    try:
-        git_common_dir = Path(
-            subprocess.check_output(
-                ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
-                text=True,
-            ).strip()
-        )
-        repo_root = Path(
-            subprocess.check_output(
-                ["git", "rev-parse", "--show-toplevel"],
-                text=True,
-            ).strip()
-        )
-    except Exception:
-        return None
+def _resolve_database_url(config_data: dict[str, object]) -> str:
+    raw_db_config = config_data.get("db")
+    if not isinstance(raw_db_config, dict):
+        raise ValueError("Config must define a [db] section")
 
-    main_repo_root = git_common_dir.parent
-    worktree_root = main_repo_root.parent / f"{main_repo_root.name}-worktrees"
-    if worktree_root not in repo_root.parents:
-        return None
+    engine = raw_db_config.get("engine")
 
-    ports_file = worktree_root / ".worktree-ports.json"
-    worktree_name = repo_root.name
+    if engine == "postgres":
+        username = raw_db_config.get("user")
+        password = raw_db_config.get("password")
+        host = raw_db_config.get("host")
+        database = raw_db_config.get("database")
+        port = raw_db_config.get("port")
+        sslmode = raw_db_config.get("sslmode")
 
-    if ports_file.is_file():
-        try:
-            ports_data = json.loads(ports_file.read_text())
-            branch_name = ports_data.get(worktree_name, {}).get("branch")
-            if isinstance(branch_name, str) and branch_name:
-                return branch_name
-        except Exception:
-            pass
-    return None
+        required_fields = {
+            "db.user": username,
+            "db.password": password,
+            "db.host": host,
+            "db.database": database,
+        }
+        missing_fields = [
+            field_name
+            for field_name, value in required_fields.items()
+            if not isinstance(value, str) or not value
+        ]
+        if missing_fields:
+            raise ValueError(
+                f"Postgres config missing required string fields: {', '.join(missing_fields)}"
+            )
+        if port is not None and not isinstance(port, int):
+            raise ValueError("db.port must be an integer when set")
+        if sslmode is not None and not isinstance(sslmode, str):
+            raise ValueError("db.sslmode must be a string when set")
+
+        query: dict[str, str] = {}
+        if sslmode:
+            query["sslmode"] = sslmode
+
+        return URL.create(
+            "postgresql",
+            username=username,
+            password=password,
+            host=host,
+            port=port,
+            database=database,
+            query=query,
+        ).render_as_string(hide_password=False)
+
+    if engine == "sqlite":
+        path = raw_db_config.get("path")
+        if not isinstance(path, str) or not path:
+            raise ValueError("SQLite config requires a non-empty db.path")
+        return URL.create("sqlite", database=path).render_as_string(hide_password=False)
+
+    raise ValueError(f"Unsupported db.engine: {engine!r}")
 
 
-def _configure_worktree_database_url() -> None:
-    # Worktree-specific databases are local development infrastructure only.
-    if not _is_development_config():
+def _configure_database_url() -> None:
+    # Only override alembic.ini when the active config is explicitly development.
+    config_data = _load_config_data()
+    if config_data is None or not _is_development_config(config_data):
         return
 
-    branch_name = _resolve_worktree_branch_name()
-    if not branch_name:
-        return
-
-    url = make_url(config.get_main_option("sqlalchemy.url"))
-    if url.drivername.startswith("postgresql"):
-        db_name = f"pingpong_{_sanitize_db_suffix(branch_name)}"
-        config.set_main_option(
-            "sqlalchemy.url",
-            str(url.set(database=db_name).render_as_string(hide_password=False)),
-        )
+    database_url = _resolve_database_url(config_data)
+    config.set_main_option("sqlalchemy.url", database_url.replace("%", "%%"))
 
 
-_configure_worktree_database_url()
+_configure_database_url()
 
 
 def run_migrations_offline() -> None:
