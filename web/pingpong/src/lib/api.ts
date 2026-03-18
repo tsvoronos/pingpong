@@ -2017,6 +2017,11 @@ export const getAssistantMCPServers = async (f: Fetcher, classId: number, assist
 	return await GET<never, MCPServerToolsResponse>(f, url);
 };
 
+export const getClassMCPServers = async (f: Fetcher, classId: number) => {
+	const url = `/class/${classId}/mcp_servers`;
+	return await GET<never, MCPServerToolsResponse>(f, url);
+};
+
 /**
  * OpenAI tool.
  */

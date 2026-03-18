@@ -994,7 +994,8 @@ async def auth_panopto_callback(request: StateRequest):
             user_id=user_id,
             panopto_tenant=tenant,
         )
-    except PanoptoException:
+    except PanoptoException as e:
+        logger.error(f"Panopto token exchange failed: {e}")
         return RedirectResponse(
             config.url(f"/group/{class_id}/manage?panopto_error=1"),
             status_code=303,
@@ -1135,6 +1136,34 @@ async def disconnect_panopto(request: StateRequest, class_id: int):
         )
 
     return {"status": "disconnected"}
+
+
+@v1.get(
+    "/class/{class_id}/mcp_servers",
+    dependencies=[Depends(Authz("can_create_assistants", "class:{class_id}"))],
+    response_model=schemas.MCPServerToolsResponse,
+)
+async def get_class_mcp_servers(request: StateRequest, class_id: int):
+    """Get class-level MCP servers (e.g. Panopto) that can be added to assistants."""
+    from sqlalchemy import select
+
+    stmt = select(models.Class.panopto_mcp_server_tool_id).where(
+        models.Class.id == class_id
+    )
+    result = await request.state["db"].execute(stmt)
+    mcp_tool_id = result.scalar_one_or_none()
+
+    mcp_servers = []
+    if mcp_tool_id:
+        stmt = select(models.MCPServerTool).where(
+            models.MCPServerTool.id == mcp_tool_id
+        )
+        tool_result = await request.state["db"].execute(stmt)
+        tool = tool_result.scalar_one_or_none()
+        if tool:
+            mcp_servers.append(mcp_server_to_response(tool))
+
+    return {"mcp_servers": mcp_servers}
 
 
 @v1.post("/mcp/panopto")
@@ -9227,8 +9256,32 @@ async def create_assistant(
             detail="Classic Assistants do not support MCP Server tools. To use MCP Servers, create a Next-Gen Assistant.",
         )
 
+    # Look up class-level MCP tool (e.g. Panopto) so we can reuse it
+    from sqlalchemy import select as sa_select
+
+    _panopto_tool_id = (
+        await request.state["db"].execute(
+            sa_select(models.Class.panopto_mcp_server_tool_id).where(
+                models.Class.id == class_id_int
+            )
+        )
+    ).scalar_one_or_none()
+    _class_mcp_tool = None
+    if _panopto_tool_id:
+        _class_mcp_tool = (
+            await request.state["db"].execute(
+                sa_select(models.MCPServerTool).where(
+                    models.MCPServerTool.id == _panopto_tool_id
+                )
+            )
+        ).scalar_one_or_none()
+    _class_mcp_tool_url = _class_mcp_tool.server_url if _class_mcp_tool else None
+
     # Validate MCP servers - auth_type must match provided credentials
+    # Skip validation for class-level MCP tools (e.g. Panopto) which already have credentials
     for mcp_input in req.mcp_servers:
+        if _class_mcp_tool_url and mcp_input.server_url_str == _class_mcp_tool_url:
+            continue
         if (
             mcp_input.auth_type == schemas.MCPAuthType.TOKEN
             and not mcp_input.authorization_token
@@ -9479,6 +9532,10 @@ async def create_assistant(
             async def create_mcp_server(
                 mcp_input: schemas.MCPServerToolInput, assistant_id: int
             ) -> models.MCPServerTool:
+                # Reuse existing class-level MCP tool (e.g. Panopto) instead of creating a duplicate
+                if _class_mcp_tool and mcp_input.server_url_str == _class_mcp_tool.server_url:
+                    return _class_mcp_tool
+
                 headers_json = None
                 authorization_token = None
                 if mcp_input.auth_type == schemas.MCPAuthType.HEADER:
@@ -10462,12 +10519,36 @@ async def update_assistant(
             detail="Assistants in Lecture Video mode do not support MCP Server tools. Please remove the MCP Server tool or create a new assistant without Lecture Video mode.",
         )
 
+    # Look up class-level MCP tool (e.g. Panopto) so we can reuse it
+    from sqlalchemy import select as sa_select
+
+    _panopto_tool_id_upd = (
+        await request.state["db"].execute(
+            sa_select(models.Class.panopto_mcp_server_tool_id).where(
+                models.Class.id == int(class_id)
+            )
+        )
+    ).scalar_one_or_none()
+    _class_mcp_tool_upd = None
+    if _panopto_tool_id_upd:
+        _class_mcp_tool_upd = (
+            await request.state["db"].execute(
+                sa_select(models.MCPServerTool).where(
+                    models.MCPServerTool.id == _panopto_tool_id_upd
+                )
+            )
+        ).scalar_one_or_none()
+    _class_mcp_tool_url_upd = _class_mcp_tool_upd.server_url if _class_mcp_tool_upd else None
+
     existing_mcp_by_label = {}
     if "mcp_servers" in req.model_fields_set and req.mcp_servers:
         existing_mcp_by_label = {s.server_label: s for s in asst.mcp_server_tools}
 
         for mcp_input in req.mcp_servers:
             if not mcp_input.server_label:
+                # Skip validation for class-level MCP tools (e.g. Panopto)
+                if _class_mcp_tool_url_upd and mcp_input.server_url_str == _class_mcp_tool_url_upd:
+                    continue
                 if (
                     mcp_input.auth_type == schemas.MCPAuthType.TOKEN
                     and not mcp_input.authorization_token
@@ -10670,6 +10751,10 @@ async def update_assistant(
     if "mcp_servers" in req.model_fields_set and req.mcp_servers is not None:
 
         async def upsert_mcp_server(mcp_input: schemas.MCPServerToolInput) -> int:
+            # Reuse existing class-level MCP tool (e.g. Panopto) instead of creating a duplicate
+            if _class_mcp_tool_upd and mcp_input.server_url_str == _class_mcp_tool_url_upd:
+                return _class_mcp_tool_upd.id
+
             headers_json = None
             authorization_token = None
 

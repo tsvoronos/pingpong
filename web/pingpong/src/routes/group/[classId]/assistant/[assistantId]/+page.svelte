@@ -836,7 +836,7 @@
 	let mcpServerToolSelect = false;
 	let hasSetMCPServerToolSelect = false;
 	$: if (initialTools !== undefined && initialTools !== null && !hasSetMCPServerToolSelect) {
-		mcpServerToolSelect = initialTools.includes('mcp_server');
+		mcpServerToolSelect = initialTools.includes('mcp_server') || data.mcpServers.length > 0;
 		hasSetMCPServerToolSelect = true;
 	}
 	let isPublished = false;

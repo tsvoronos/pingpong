@@ -12,6 +12,7 @@ import type {
 import {
 	getAssistantFiles,
 	getAssistantMCPServers,
+	getClassMCPServers,
 	getAssistantLectureVideoConfig,
 	getLectureVideoEditorPolicy,
 	expandResponse,
@@ -87,6 +88,16 @@ async function loadAssistantMCPServers(
 	return response.error ? [] : response.data.mcp_servers;
 }
 
+async function loadClassMCPServers(
+	fetchFn: typeof fetch,
+	classId: number
+): Promise<MCPServerToolInput[]> {
+	const response = await getClassMCPServers(fetchFn, classId).then(expandResponse);
+	if (response.error) return [];
+	// Pre-populate with enabled=false and no server_label (treated as new when saving)
+	return response.data.mcp_servers.map((s: MCPServerToolInput) => ({ ...s, enabled: false, server_label: undefined }));
+}
+
 async function loadAssistantLectureVideoConfig(
 	fetchFn: typeof fetch,
 	classId: number,
@@ -136,7 +147,12 @@ export const load: PageLoad = async ({ params, fetch, parent }) => {
 	let lectureVideoConfig: LectureVideoConfigResponse | null = null;
 	let lectureVideoConfigLoadError: (ApiError & { $status: number }) | null = null;
 
-	if (!isCreating) {
+	// Always load class-level MCP servers (e.g. Panopto)
+	const classMCPServers = await loadClassMCPServers(fetch, classId);
+
+	if (isCreating) {
+		mcpServers = classMCPServers;
+	} else {
 		const assistants = parentData.assistants ?? [];
 		const id = parseInt(params.assistantId, 10);
 		assistant = assistants.find((a) => a.id === id) ?? null;
@@ -148,6 +164,17 @@ export const load: PageLoad = async ({ params, fetch, parent }) => {
 			]);
 			assistantFiles = files;
 			mcpServers = servers;
+
+			// Merge in class-level MCP servers that aren't already on this assistant
+			for (const classServer of classMCPServers) {
+				const alreadyExists = mcpServers.some(
+					(s) => s.server_url === classServer.server_url
+				);
+				if (!alreadyExists) {
+					mcpServers.push(classServer);
+				}
+			}
+
 			if (assistant.interaction_mode === 'lecture_video') {
 				const lectureVideoConfigResult = await loadAssistantLectureVideoConfig(
 					fetch,
