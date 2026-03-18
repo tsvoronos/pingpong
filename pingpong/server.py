@@ -64,6 +64,7 @@ from pingpong.artifacts import ArtifactStoreError
 from pingpong.audio_store import AudioStoreError
 from pingpong.bg_tasks import safe_task
 from pingpong.copy import copy_assistant as copy_assistant_to_class
+from pingpong.copy import ensure_lecture_video_assistant_copy_ready
 from pingpong.copy import ensure_lecture_video_copy_credentials
 from pingpong.copy import copy_group
 from pingpong.class_credentials import (
@@ -105,7 +106,12 @@ from pingpong.stream_utils import prefetch_stream
 from pingpong.summary import send_class_summary_to_user_task
 from pingpong.video_store import VideoStoreError
 
-from . import assistant_service, lecture_video_runtime, lecture_video_service
+from . import (
+    assistant_service,
+    lecture_video_processing,
+    lecture_video_runtime,
+    lecture_video_service,
+)
 from .ai import (
     GetOpenAIClientException,
     export_class_threads_anonymized,
@@ -6413,6 +6419,14 @@ async def create_lecture_thread(
             detail="This assistant does not have a lecture video attached. Unable to create Lecture Presentation",
         )
     if assistant.lecture_video.status != schemas.LectureVideoStatus.READY:
+        if assistant.lecture_video.status == schemas.LectureVideoStatus.FAILED:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "This assistant's lecture video narration processing failed. "
+                    "Edit the assistant and retry."
+                ),
+            )
         raise HTTPException(
             status_code=409,
             detail="This assistant's lecture video is not ready yet.",
@@ -8364,6 +8378,75 @@ async def get_assistant_lecture_video_config(
 
 
 @v1.post(
+    "/class/{class_id}/assistant/{assistant_id}/lecture-video/retry",
+    dependencies=[Depends(Authz("can_edit", "assistant:{assistant_id}"))],
+    response_model=schemas.LectureVideoSummary,
+)
+async def retry_assistant_lecture_video_processing(
+    class_id: str,
+    assistant_id: str,
+    request: StateRequest,
+):
+    assistant = await lecture_video_service.get_lecture_video_assistant_for_class(
+        request.state["db"], int(assistant_id), int(class_id)
+    )
+    if assistant.lecture_video_id is None:
+        raise HTTPException(404, "Lecture video not found.")
+
+    lecture_video = await models.LectureVideo.get_by_id_with_copy_context(
+        request.state["db"], assistant.lecture_video_id
+    )
+    if lecture_video is None:
+        raise HTTPException(404, "Lecture video not found.")
+    if lecture_video.status != schemas.LectureVideoStatus.FAILED:
+        raise HTTPException(
+            status_code=409,
+            detail="Lecture video retry is only available after narration processing fails.",
+        )
+
+    claimed_for_retry = (
+        await lecture_video_processing.claim_failed_lecture_video_for_retry(
+            request.state["db"], lecture_video.id
+        )
+    )
+    if not claimed_for_retry:
+        raise HTTPException(
+            status_code=409,
+            detail="Lecture video retry is only available after narration processing fails.",
+        )
+
+    audio_keys_to_delete = (
+        await lecture_video_processing.reset_failed_narrations_for_retry(
+            request.state["db"], lecture_video.id
+        )
+    )
+    refreshed_lecture_video = await models.LectureVideo.get_by_id_with_copy_context(
+        request.state["db"], lecture_video.id
+    )
+    if refreshed_lecture_video is None:
+        raise HTTPException(404, "Lecture video not found.")
+    narration_run = await lecture_video_processing.queue_narration_processing_run(
+        request.state["db"],
+        refreshed_lecture_video,
+        assistant_id_at_start=assistant.id,
+    )
+    if narration_run is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Lecture video retry is no longer available because the assistant or lecture video configuration changed.",
+        )
+    if audio_keys_to_delete and config.lecture_video_audio_store:
+        for key in audio_keys_to_delete:
+            await lecture_video_processing._delete_audio_key_quietly(key)
+    refreshed_lecture_video_summary = await models.LectureVideo.get_by_id(
+        request.state["db"], lecture_video.id
+    )
+    return await lecture_video_service.lecture_video_summary_from_model(
+        request.state["db"], refreshed_lecture_video_summary or refreshed_lecture_video
+    )
+
+
+@v1.post(
     "/class/{class_id}/lecture-video/voice/validate",
     dependencies=[
         Depends(Authz("can_create_assistants", "class:{class_id}")),
@@ -9043,6 +9126,11 @@ async def create_assistant(
                 lecture_video_manifest,
                 voice_id=lecture_video_voice_id,
             )
+            await lecture_video_processing.queue_narration_processing_run(
+                request.state["db"],
+                lecture_video,
+                assistant_id_at_start=asst.id,
+            )
 
         # Delete private files uploaded but not attached to the assistant
         files_to_delete = await models.File.get_files_not_used_by_assistant(
@@ -9169,6 +9257,14 @@ async def _ensure_lecture_video_assistant_copy_allowed(
     assistant: models.Assistant,
     target_class_id: int,
 ) -> None:
+    try:
+        ensure_lecture_video_assistant_copy_ready(assistant)
+    except ValueError as e:
+        raise HTTPException(
+            status_code=409,
+            detail=str(e),
+        ) from e
+
     if assistant.interaction_mode != schemas.InteractionMode.LECTURE_VIDEO:
         return
 
@@ -9306,7 +9402,9 @@ async def copy_assistant_check(
     request: StateRequest,
     copy_options: schemas.CopyAssistantRequest,
 ):
-    assistant = await models.Assistant.get_by_id(request.state["db"], int(assistant_id))
+    assistant = await models.Assistant.get_by_id_with_lecture_video(
+        request.state["db"], int(assistant_id)
+    )
     class_id_int = int(class_id)
     if not assistant or assistant.class_id != class_id_int:
         raise HTTPException(
@@ -10586,6 +10684,11 @@ async def update_assistant(
                     lecture_video_manifest,
                     voice_id=lecture_video_voice_id,
                 )
+                await lecture_video_processing.queue_narration_processing_run(
+                    request.state["db"],
+                    target_lecture_video,
+                    assistant_id_at_start=asst.id,
+                )
 
         await models.Thread.update_tools_available(
             request.state["db"],
@@ -10703,6 +10806,12 @@ async def update_assistant(
     await request.state["authz"].write_safe(grant=grants, revoke=revokes)
     if lecture_video_id_to_delete is not None:
         try:
+            # Cancel first in case the old lecture video is still kept alive by threads.
+            await lecture_video_processing.cancel_narration_processing_runs(
+                request.state["db"],
+                lecture_video_id_to_delete,
+                schemas.LectureVideoProcessingCancelReason.ASSISTANT_DETACHED,
+            )
             await lecture_video_service.delete_lecture_video_if_unused(
                 request.state["db"],
                 lecture_video_id_to_delete,
@@ -10908,6 +11017,12 @@ async def delete_assistant(
     await request.state["authz"].write_safe(revoke=revokes)
     if lecture_video_id_to_delete is not None:
         try:
+            # Cancel first in case the lecture video is still kept alive by threads.
+            await lecture_video_processing.cancel_narration_processing_runs(
+                request.state["db"],
+                lecture_video_id_to_delete,
+                schemas.LectureVideoProcessingCancelReason.ASSISTANT_DELETED,
+            )
             await lecture_video_service.delete_lecture_video_if_unused(
                 request.state["db"],
                 lecture_video_id_to_delete,

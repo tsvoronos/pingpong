@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { resolve } from '$app/paths';
+	import * as api from '$lib/api';
 	import type { Assistant } from '$lib/api';
 	import ViewAssistant from '$lib/components/ViewAssistant.svelte';
 	import {
@@ -39,10 +40,12 @@
 		performCopyAssistant,
 		performDeleteAssistant
 	} from '$lib/assistantHelpers';
+	import { SvelteSet } from 'svelte/reactivity';
 
 	export let data;
 
 	$: hasApiKey = !!data?.hasAPIKey;
+	let creators: api.AssistantCreators = {};
 	$: creators = data?.assistantCreators || {};
 	$: moderators = data?.supervisors || [];
 	// "Course" assistants are endorsed by the class. Right now this means
@@ -63,6 +66,8 @@
 	let copyPermissionAllowed: Record<number, boolean> = {};
 	let copyPermissionLoading: Record<number, boolean> = {};
 	let copyPermissionError: Record<number, string> = {};
+	let assistants: Assistant[] = [];
+	let lectureVideoRefreshingIds = new Set<number>();
 	const baseUrl = typeof window !== 'undefined' ? window.location.origin : '';
 	const classOptions = (data.classes || []).map((c) => ({
 		id: c.id,
@@ -197,8 +202,41 @@
 		updateCopyTarget(assistantId, value);
 		void checkCopyPermission(assistantId, value);
 	};
+	const sortAssistantsByName = (items: Assistant[]) =>
+		[...items].sort((a, b) => a.name.localeCompare(b.name));
+
+	const refreshLectureVideoAssistant = async (assistantId: number) => {
+		if (lectureVideoRefreshingIds.has(assistantId)) {
+			return;
+		}
+
+		const assistant = assistants.find((candidate) => candidate.id === assistantId);
+		if (!assistant?.lecture_video) {
+			return;
+		}
+
+		lectureVideoRefreshingIds = new Set([...lectureVideoRefreshingIds, assistantId]);
+		try {
+			const response = await api.getAssistants(fetch, data.class.id);
+			const expanded = api.expandResponse(response);
+			if (expanded.error || !expanded.data) {
+				sadToast(
+					`Could not refresh lecture video status:\n${expanded.error?.detail || 'Unknown error'}`
+				);
+				return;
+			}
+
+			assistants = sortAssistantsByName(expanded.data.assistants);
+			creators = expanded.data.creators;
+		} finally {
+			const nextRefreshingIds = new SvelteSet(lectureVideoRefreshingIds);
+			nextRefreshingIds.delete(assistantId);
+			lectureVideoRefreshingIds = nextRefreshingIds;
+		}
+	};
+	$: assistants = data?.assistants || [];
 	$: {
-		const allAssistants = data?.assistants || [];
+		const allAssistants = assistants || [];
 		// Split all assistants into categories
 		courseAssistants = allAssistants.filter((assistant) => assistant.endorsed);
 		myAssistants = allAssistants.filter(
@@ -246,6 +284,8 @@
 					creator={creators[assistant.creator_id]}
 					editable={data.editableAssistants.has(assistant.id)}
 					currentClassId={data.class.id}
+					lectureVideoRefreshing={lectureVideoRefreshingIds.has(assistant.id)}
+					onRefreshLectureVideo={() => void refreshLectureVideoAssistant(assistant.id)}
 					{classOptions}
 				/>
 			{:else}
@@ -264,6 +304,8 @@
 					editable={data.editableAssistants.has(assistant.id)}
 					shareable={data.grants.canShareAssistants && !!assistant.published}
 					currentClassId={data.class.id}
+					lectureVideoRefreshing={lectureVideoRefreshingIds.has(assistant.id)}
+					onRefreshLectureVideo={() => void refreshLectureVideoAssistant(assistant.id)}
 					{classOptions}
 				/>
 			{:else}

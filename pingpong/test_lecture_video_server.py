@@ -1,11 +1,17 @@
+import asyncio
 import importlib
 import io
+import logging
+import queue as queue_module
+import signal
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Literal
 from unittest.mock import AsyncMock
 
 import pytest
+from click.testing import CliRunner
 from fastapi import HTTPException, UploadFile
 from pydantic import ValidationError
 from sqlalchemy import delete, func, select, text
@@ -17,18 +23,93 @@ import pingpong.schemas as schemas
 from pingpong import (
     class_credentials as class_credentials_module,
     elevenlabs as elevenlabs_module,
+    lecture_video_processing,
     lecture_video_runtime,
     lecture_video_service,
     models,
+    worker_pool as worker_pool_module,
 )
 from pingpong.animal_hash import pseudonym
 from pingpong.authz.openfga import OpenFgaAuthzClient
+from pingpong.class_credential_validation import (
+    ClassCredentialValidationUnavailableError,
+)
 from pingpong.config import LocalAudioStoreSettings, LocalVideoStoreSettings
 
 from .testutil import with_authz, with_institution, with_user
 
 DEFAULT_LECTURE_VIDEO_VOICE_ID = "voice-test-id"
 server_module = importlib.import_module("pingpong.server")
+cli_module = importlib.import_module("pingpong.__main__")
+
+
+class FakeQueue:
+    def __init__(self) -> None:
+        self.items: list[object] = []
+        self.puts: list[object] = []
+        self.closed = False
+        self.join_thread_called = False
+
+    def put(self, item: object) -> None:
+        self.items.append(item)
+        self.puts.append(item)
+
+    def get(self) -> object:
+        return self.get_nowait()
+
+    def get_nowait(self) -> object:
+        if not self.items:
+            raise queue_module.Empty
+        return self.items.pop(0)
+
+    def close(self) -> None:
+        self.closed = True
+
+    def join_thread(self) -> None:
+        self.join_thread_called = True
+
+
+class FakeProcess:
+    next_pid = 5000
+
+    def __init__(self, target=None, args=(), daemon=None) -> None:  # type: ignore[no-untyped-def]
+        self.target = target
+        self.args = args
+        self.daemon = daemon
+        self.pid: int | None = None
+        self.exitcode: int | None = None
+        self.join_calls: list[float | None] = []
+        self.terminate_called = False
+        self.exit_after_join: int | None = None
+
+    def start(self) -> None:
+        self.pid = FakeProcess.next_pid
+        FakeProcess.next_pid += 1
+
+    def join(self, timeout: float | None = None) -> None:
+        self.join_calls.append(timeout)
+        if self.exitcode is None and self.exit_after_join is not None:
+            self.exitcode = self.exit_after_join
+
+    def terminate(self) -> None:
+        self.terminate_called = True
+        self.exitcode = -15
+
+
+class FakeProcessContext:
+    def __init__(self) -> None:
+        self.queues: list[FakeQueue] = []
+        self.processes: list[FakeProcess] = []
+
+    def Queue(self) -> FakeQueue:  # noqa: N802
+        queue = FakeQueue()
+        self.queues.append(queue)
+        return queue
+
+    def Process(self, target=None, args=(), daemon=None) -> FakeProcess:  # noqa: N802
+        process = FakeProcess(target=target, args=args, daemon=daemon)
+        self.processes.append(process)
+        return process
 
 
 @pytest.fixture(autouse=True)
@@ -227,6 +308,31 @@ async def create_ready_lecture_video_assistant(
         voice_id=DEFAULT_LECTURE_VIDEO_VOICE_ID,
         create_narration_placeholders=True,
     )
+    loaded_lecture_video = await models.LectureVideo.get_by_id_with_copy_context(
+        session, lecture_video.id
+    )
+    assert loaded_lecture_video is not None
+    narration_index = 0
+    for question in loaded_lecture_video.questions:
+        if question.intro_narration is not None:
+            await attach_ready_narration(
+                session,
+                question.intro_narration,
+                key=f"ready-intro-{lecture_video.id}-{narration_index}.ogg",
+            )
+            narration_index += 1
+        for option in question.options:
+            if option.post_narration is not None:
+                await attach_ready_narration(
+                    session,
+                    option.post_narration,
+                    key=f"ready-option-{lecture_video.id}-{narration_index}.ogg",
+                )
+                narration_index += 1
+    loaded_lecture_video.status = schemas.LectureVideoStatus.READY
+    loaded_lecture_video.error_message = None
+    session.add(loaded_lecture_video)
+    await session.flush()
 
     assistant = models.Assistant(
         id=assistant_id,
@@ -247,12 +353,78 @@ async def create_ready_lecture_video_assistant(
     return class_, lecture_video, assistant
 
 
+async def create_processing_lecture_video_assistant(
+    session,
+    institution,
+    *,
+    class_id: int = 1,
+    assistant_id: int = 1,
+    lecture_video_id: int = 1,
+    video_key: str = "lecture-processing.mp4",
+    manifest: dict | None = None,
+):
+    class_ = models.Class(
+        id=class_id,
+        name="Processing Lecture Class",
+        institution_id=institution.id,
+        api_key="test-key",
+    )
+    session.add(class_)
+    await session.flush()
+
+    lecture_video = make_lecture_video(
+        class_.id,
+        video_key,
+        filename=video_key,
+        content_length=128,
+        status=schemas.LectureVideoStatus.UPLOADED.value,
+    )
+    lecture_video.id = lecture_video_id
+    session.add(lecture_video)
+    await create_lecture_video_copy_credentials(session, class_.id)
+    await session.flush()
+
+    assistant = models.Assistant(
+        id=assistant_id,
+        name="Lecture Assistant",
+        class_id=class_.id,
+        interaction_mode=schemas.InteractionMode.LECTURE_VIDEO,
+        version=3,
+        lecture_video_id=lecture_video.id,
+        instructions="You are a lecture assistant.",
+        model="gpt-4o-mini",
+        tools="[]",
+        use_latex=False,
+        use_image_descriptions=False,
+        hide_prompt=False,
+    )
+    session.add(assistant)
+    await session.flush()
+
+    await lecture_video_service.persist_manifest(
+        session,
+        lecture_video,
+        schemas.LectureVideoManifestV1.model_validate(
+            manifest or lecture_video_manifest()
+        ),
+        voice_id=DEFAULT_LECTURE_VIDEO_VOICE_ID,
+    )
+    run = await lecture_video_processing.queue_narration_processing_run(
+        session,
+        lecture_video,
+        assistant_id_at_start=assistant.id,
+    )
+
+    await session.commit()
+    return class_, lecture_video, assistant, run
+
+
 async def attach_ready_narration(
     session,
     narration: models.LectureVideoNarration,
     *,
     key: str,
-    content_type: str = "audio/mpeg",
+    content_type: str = "audio/ogg",
     content_length: int = 16,
 ):
     stored_object = models.LectureVideoNarrationStoredObject(
@@ -3285,7 +3457,9 @@ async def test_create_lecture_video_assistant_persists_normalized_manifest(
     assert response.status_code == 200
     body = response.json()
     assert body["lecture_video"]["id"] == lecture_video.id
-    assert body["lecture_video"]["status"] == schemas.LectureVideoStatus.READY.value
+    assert (
+        body["lecture_video"]["status"] == schemas.LectureVideoStatus.PROCESSING.value
+    )
     assert "lecture_video_manifest" not in body
 
     async with db.async_session() as session:
@@ -3313,14 +3487,18 @@ async def test_create_lecture_video_assistant_persists_normalized_manifest(
         narration_count = await session.scalar(
             select(func.count()).select_from(models.LectureVideoNarration)
         )
+        processing_run_count = await session.scalar(
+            select(func.count()).select_from(models.LectureVideoProcessingRun)
+        )
 
     assert refreshed_video is not None
-    assert refreshed_video.status == schemas.LectureVideoStatus.READY.value
+    assert refreshed_video.status == schemas.LectureVideoStatus.PROCESSING.value
     assert refreshed_video.voice_id == DEFAULT_LECTURE_VIDEO_VOICE_ID
     assert question_count == 1
     assert option_count == 2
     assert single_select_correct_option_count == 1
-    assert narration_count == 0
+    assert narration_count == 3
+    assert processing_run_count == 1
 
 
 @with_user(123)
@@ -3384,6 +3562,1119 @@ async def test_create_lecture_video_assistant_requires_provider_credentials(
     assert assistant_count == 0
     assert refreshed_video is not None
     assert refreshed_video.status == schemas.LectureVideoStatus.UPLOADED.value
+
+
+@with_institution(11, "Test Institution")
+async def test_process_claimed_narration_run_marks_lecture_video_ready_and_stores_audio(
+    db, institution, config, monkeypatch, tmp_path
+):
+    narration_dir = tmp_path / "narration-audio"
+    monkeypatch.setattr(
+        config,
+        "lecture_video_audio_store",
+        LocalAudioStoreSettings(save_target=str(narration_dir)),
+    )
+    monkeypatch.setattr(
+        lecture_video_processing,
+        "synthesize_elevenlabs_speech",
+        AsyncMock(return_value=("audio/ogg", b"fake-opus-audio")),
+    )
+
+    async with db.async_session() as session:
+        (
+            _class_,
+            lecture_video,
+            _assistant,
+            run,
+        ) = await create_processing_lecture_video_assistant(session, institution)
+        assert run is not None
+
+    claim = await lecture_video_processing._claim_next_narration_run(
+        leased_by="test-runner"
+    )
+    assert claim is not None
+    run_id, lease_token = claim
+    await lecture_video_processing._process_claimed_narration_run(run_id, lease_token)
+
+    async with db.async_session() as session:
+        refreshed_video = await models.LectureVideo.get_by_id_with_copy_context(
+            session, lecture_video.id
+        )
+        refreshed_run = await models.LectureVideoProcessingRun.get_by_id(
+            session, run.id
+        )
+        narrations = list(
+            (
+                await session.scalars(
+                    select(models.LectureVideoNarration)
+                    .options(selectinload(models.LectureVideoNarration.stored_object))
+                    .order_by(models.LectureVideoNarration.id.asc())
+                )
+            ).all()
+        )
+
+    assert refreshed_video is not None
+    assert refreshed_video.status == schemas.LectureVideoStatus.READY
+    assert refreshed_video.error_message is None
+    assert refreshed_run is not None
+    assert refreshed_run.status == schemas.LectureVideoProcessingRunStatus.COMPLETED
+    assert len(narrations) == 3
+    assert all(
+        narration.status == schemas.LectureVideoNarrationStatus.READY
+        and narration.stored_object is not None
+        and narration.stored_object.content_type == "audio/ogg"
+        for narration in narrations
+    )
+    for narration in narrations:
+        assert (narration_dir / narration.stored_object.key).exists()
+
+
+@with_institution(11, "Test Institution")
+async def test_process_claimed_narration_run_marks_failed_on_provider_error(
+    db, institution, monkeypatch
+):
+    monkeypatch.setattr(
+        lecture_video_processing,
+        "synthesize_elevenlabs_speech",
+        AsyncMock(
+            side_effect=ClassCredentialValidationUnavailableError(
+                provider=schemas.ClassCredentialProvider.ELEVENLABS,
+                message="ElevenLabs is temporarily unavailable.",
+            )
+        ),
+    )
+
+    async with db.async_session() as session:
+        (
+            _class_,
+            lecture_video,
+            _assistant,
+            run,
+        ) = await create_processing_lecture_video_assistant(session, institution)
+        assert run is not None
+
+    claim = await lecture_video_processing._claim_next_narration_run(
+        leased_by="test-runner"
+    )
+    assert claim is not None
+    run_id, lease_token = claim
+    await lecture_video_processing._process_claimed_narration_run(run_id, lease_token)
+
+    async with db.async_session() as session:
+        refreshed_video = await models.LectureVideo.get_by_id(session, lecture_video.id)
+        refreshed_run = await models.LectureVideoProcessingRun.get_by_id(
+            session, run.id
+        )
+        narrations = list(
+            (
+                await session.scalars(
+                    select(models.LectureVideoNarration).order_by(
+                        models.LectureVideoNarration.id.asc()
+                    )
+                )
+            ).all()
+        )
+
+    assert refreshed_video is not None
+    assert refreshed_video.status == schemas.LectureVideoStatus.FAILED
+    assert refreshed_video.error_message == "ElevenLabs is temporarily unavailable."
+    assert refreshed_run is not None
+    assert refreshed_run.status == schemas.LectureVideoProcessingRunStatus.FAILED
+    assert refreshed_run.error_message == "ElevenLabs is temporarily unavailable."
+    assert narrations[0].status == schemas.LectureVideoNarrationStatus.FAILED
+    assert narrations[1].status == schemas.LectureVideoNarrationStatus.PENDING
+    assert narrations[2].status == schemas.LectureVideoNarrationStatus.PENDING
+
+
+async def test_process_claimed_narration_run_raises_type_error_for_unexpected_work_item(
+    monkeypatch,
+):
+    prepare_next_work_item = AsyncMock(return_value=("work", object()))
+    synthesize = AsyncMock()
+
+    monkeypatch.setattr(
+        lecture_video_processing,
+        "_prepare_next_work_item",
+        prepare_next_work_item,
+    )
+    monkeypatch.setattr(
+        lecture_video_processing,
+        "synthesize_elevenlabs_speech",
+        synthesize,
+    )
+
+    with pytest.raises(TypeError, match="Expected NarrationWorkItem, got object"):
+        await lecture_video_processing._process_claimed_narration_run(1, "lease-token")
+
+    synthesize.assert_not_awaited()
+
+
+def test_get_forkserver_context_requires_forkserver(monkeypatch):
+    monkeypatch.setattr(
+        lecture_video_processing.multiprocessing,
+        "get_all_start_methods",
+        lambda: ["spawn", "fork"],
+    )
+
+    with pytest.raises(RuntimeError):
+        lecture_video_processing.get_forkserver_context()
+
+
+def test_get_forkserver_context_requests_forkserver(monkeypatch):
+    seen: dict[str, object] = {}
+    expected_context = object()
+
+    monkeypatch.setattr(
+        lecture_video_processing.multiprocessing,
+        "get_all_start_methods",
+        lambda: ["spawn", "forkserver"],
+    )
+    monkeypatch.setattr(
+        lecture_video_processing.multiprocessing,
+        "get_context",
+        lambda start_method: seen.__setitem__("start_method", start_method)
+        or expected_context,
+    )
+
+    context = lecture_video_processing.get_forkserver_context()
+
+    assert seen["start_method"] == "forkserver"
+    assert context is expected_context
+
+
+def test_build_runner_id_uses_worker_slot_and_pid():
+    runner_id = lecture_video_processing.build_runner_id(worker_slot=3, pid=4242)
+    fallback_runner_id = lecture_video_processing.build_runner_id(worker_slot=4, pid=7)
+
+    assert runner_id.endswith(":4242:worker-3")
+    assert fallback_runner_id.endswith(":7:worker-4")
+    assert runner_id != fallback_runner_id
+
+
+def test_worker_process_main_ignores_sigint_before_waiting_for_assignments(
+    monkeypatch,
+):
+    fake_assignment_queue = FakeQueue()
+    fake_result_queue = FakeQueue()
+    fake_assignment_queue.put(None)
+    seen: dict[str, bool] = {}
+
+    @contextmanager
+    def fake_sentry():
+        yield
+
+    monkeypatch.setattr(lecture_video_processing, "sentry", fake_sentry)
+    monkeypatch.setattr(
+        lecture_video_processing,
+        "ignore_sigint_in_worker",
+        lambda: seen.setdefault("ignored", True),
+    )
+    monkeypatch.setattr(lecture_video_processing.os, "getpid", lambda: 4242)
+
+    lecture_video_processing._worker_process_main(
+        2,
+        fake_assignment_queue,
+        fake_result_queue,
+    )
+
+    assert seen == {"ignored": True}
+    assert fake_result_queue.puts == [
+        lecture_video_processing.WorkerReady(worker_slot=2, pid=4242)
+    ]
+
+
+def test_worker_process_main_raises_type_error_for_unexpected_assignment(
+    monkeypatch,
+):
+    fake_assignment_queue = FakeQueue()
+    fake_result_queue = FakeQueue()
+    fake_assignment_queue.put(object())
+
+    @contextmanager
+    def fake_sentry():
+        yield
+
+    monkeypatch.setattr(lecture_video_processing, "sentry", fake_sentry)
+    monkeypatch.setattr(
+        lecture_video_processing,
+        "ignore_sigint_in_worker",
+        lambda: None,
+    )
+    monkeypatch.setattr(lecture_video_processing.os, "getpid", lambda: 4242)
+
+    with pytest.raises(TypeError, match="Expected RunAssignment, got object"):
+        lecture_video_processing._worker_process_main(
+            2,
+            fake_assignment_queue,
+            fake_result_queue,
+        )
+
+
+def test_worker_pool_manager_uses_generic_labels_and_recovery(caplog):
+    fake_context = FakeProcessContext()
+    recoveries: list[tuple[int, str, str]] = []
+    claims = iter([(41, "lease-41"), None])
+
+    manager = lecture_video_processing.WorkerPoolManager(
+        workers=1,
+        worker_target=lambda *_args: None,
+        process_context=fake_context,
+        claim_run_fn=lambda _runner_id: next(claims),
+        recover_run_fn=lambda run_id, lease_token, error_message: recoveries.append(
+            (run_id, lease_token, error_message)
+        )
+        or True,
+        build_runner_id_fn=lambda worker_slot, pid: f"custom:{worker_slot}:{pid}",
+        worker_label="custom worker",
+        unexpected_exit_error_message="custom exit",
+        poll_interval_seconds=0.25,
+    )
+
+    with caplog.at_level(logging.INFO):
+        manager.start()
+        progress = manager.run_one_iteration()
+        manager.results_queue.put(
+            lecture_video_processing.WorkerJobException(
+                worker_slot=0,
+                run_id=41,
+                lease_token="lease-41",
+                error_message="",
+            )
+        )
+        recovery_progress = manager.run_one_iteration()
+
+    assert progress is True
+    assert recovery_progress is True
+    assert isinstance(
+        manager.worker_slots[0].assignment_queue.puts[0],
+        lecture_video_processing.RunAssignment,
+    )
+    assert recoveries == [(41, "lease-41", "custom exit")]
+    assert manager.worker_slots[0].idle is True
+    assert manager.worker_slots[0].run_id is None
+    assert manager.worker_slots[0].lease_token is None
+    assert "Started custom worker process." in caplog.text
+    assert "Custom worker reported job exception." in caplog.text
+    assert "Lecture video worker" not in caplog.text
+
+
+def test_narration_worker_pool_manager_assigns_runs_to_idle_workers():
+    fake_context = FakeProcessContext()
+    claims = iter([(11, "lease-11"), (12, "lease-12"), None])
+
+    manager = lecture_video_processing.NarrationWorkerPoolManager(
+        workers=3,
+        poll_interval_seconds=0.25,
+        process_context=fake_context,
+        claim_run_fn=lambda _runner_id: next(claims),
+        recover_run_fn=lambda *_args: True,
+    )
+
+    manager.start()
+    progress = manager.run_one_iteration()
+
+    assert progress is True
+    assert len(fake_context.processes) == 3
+    assert isinstance(
+        manager.worker_slots[0].assignment_queue.puts[0],
+        lecture_video_processing.RunAssignment,
+    )
+    assert manager.worker_slots[0].run_id == 11
+    assert manager.worker_slots[1].run_id == 12
+    assert manager.worker_slots[2].idle is True
+
+
+def test_narration_worker_pool_manager_recovers_job_exception_and_keeps_worker_idle():
+    fake_context = FakeProcessContext()
+    recoveries: list[tuple[int, str, str]] = []
+    claims = iter([(21, "lease-21"), None])
+
+    manager = lecture_video_processing.NarrationWorkerPoolManager(
+        workers=1,
+        poll_interval_seconds=0.25,
+        process_context=fake_context,
+        claim_run_fn=lambda _runner_id: next(claims),
+        recover_run_fn=lambda run_id, lease_token, error_message: recoveries.append(
+            (run_id, lease_token, error_message)
+        )
+        or True,
+    )
+
+    manager.start()
+    manager.run_one_iteration()
+    manager.results_queue.put(
+        lecture_video_processing.WorkerJobException(
+            worker_slot=0,
+            run_id=21,
+            lease_token="lease-21",
+            error_message="boom",
+        )
+    )
+
+    progress = manager.run_one_iteration()
+
+    assert progress is True
+    assert recoveries == [(21, "lease-21", "boom")]
+    assert manager.worker_slots[0].idle is True
+    assert manager.worker_slots[0].run_id is None
+    assert manager.worker_slots[0].lease_token is None
+
+
+def test_narration_worker_pool_manager_clears_assignment_if_job_recovery_raises():
+    fake_context = FakeProcessContext()
+    claims = iter([(22, "lease-22"), None])
+
+    manager = lecture_video_processing.NarrationWorkerPoolManager(
+        workers=1,
+        poll_interval_seconds=0.25,
+        process_context=fake_context,
+        claim_run_fn=lambda _runner_id: next(claims),
+        recover_run_fn=lambda *_args: (_ for _ in ()).throw(RuntimeError("db down")),
+    )
+
+    manager.start()
+    manager.run_one_iteration()
+    manager.results_queue.put(
+        lecture_video_processing.WorkerJobException(
+            worker_slot=0,
+            run_id=22,
+            lease_token="lease-22",
+            error_message="boom",
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="db down"):
+        manager.run_one_iteration()
+
+    assert manager.worker_slots[0].idle is True
+    assert manager.worker_slots[0].run_id is None
+    assert manager.worker_slots[0].lease_token is None
+
+
+def test_narration_worker_pool_manager_recovers_dead_worker_and_respawns():
+    fake_context = FakeProcessContext()
+    recoveries: list[tuple[int, str, str]] = []
+    claims = iter([(31, "lease-31"), None, None])
+
+    manager = lecture_video_processing.NarrationWorkerPoolManager(
+        workers=1,
+        poll_interval_seconds=0.25,
+        process_context=fake_context,
+        claim_run_fn=lambda _runner_id: next(claims),
+        recover_run_fn=lambda run_id, lease_token, error_message: recoveries.append(
+            (run_id, lease_token, error_message)
+        )
+        or True,
+    )
+
+    manager.start()
+    original_pid = manager.worker_slots[0].pid
+    manager.run_one_iteration()
+    manager.worker_slots[0].process.exitcode = 1
+
+    progress = manager.run_one_iteration()
+
+    assert progress is True
+    assert recoveries == [
+        (
+            31,
+            "lease-31",
+            lecture_video_processing.UNEXPECTED_WORKER_EXIT_ERROR_MESSAGE,
+        )
+    ]
+    assert len(fake_context.processes) == 2
+    assert manager.worker_slots[0].pid != original_pid
+    assert manager.worker_slots[0].idle is True
+
+
+def test_narration_worker_pool_manager_clears_assignment_if_dead_worker_recovery_raises():
+    fake_context = FakeProcessContext()
+    claims = iter([(32, "lease-32"), None])
+
+    manager = lecture_video_processing.NarrationWorkerPoolManager(
+        workers=1,
+        poll_interval_seconds=0.25,
+        process_context=fake_context,
+        claim_run_fn=lambda _runner_id: next(claims),
+        recover_run_fn=lambda *_args: (_ for _ in ()).throw(RuntimeError("db down")),
+    )
+
+    manager.start()
+    manager.run_one_iteration()
+    manager.worker_slots[0].process.exitcode = 1
+
+    with pytest.raises(RuntimeError, match="db down"):
+        manager.run_one_iteration()
+
+    assert manager.worker_slots[0].idle is True
+    assert manager.worker_slots[0].run_id is None
+    assert manager.worker_slots[0].lease_token is None
+
+
+def test_narration_worker_pool_manager_shutdown_terminates_only_stuck_workers():
+    fake_context = FakeProcessContext()
+    manager = lecture_video_processing.NarrationWorkerPoolManager(
+        workers=2,
+        poll_interval_seconds=0.25,
+        process_context=fake_context,
+        claim_run_fn=lambda _runner_id: None,
+        recover_run_fn=lambda *_args: True,
+        shutdown_grace_seconds=1.0,
+    )
+
+    manager.start()
+    first_slot = manager.worker_slots[0]
+    second_slot = manager.worker_slots[1]
+    first_slot.process.exit_after_join = 0
+
+    manager.shutdown()
+
+    assert first_slot.assignment_queue.puts[-1] is None
+    assert second_slot.assignment_queue.puts[-1] is None
+    assert first_slot.process.terminate_called is False
+    assert second_slot.process.terminate_called is True
+
+
+def test_narration_worker_pool_manager_shutdown_recovers_busy_assignments_before_terminate():
+    fake_context = FakeProcessContext()
+    recoveries: list[tuple[int, str, str]] = []
+    claims = iter([(41, "lease-41"), None])
+    manager = lecture_video_processing.NarrationWorkerPoolManager(
+        workers=1,
+        poll_interval_seconds=0.25,
+        process_context=fake_context,
+        claim_run_fn=lambda _runner_id: next(claims),
+        recover_run_fn=lambda run_id, lease_token, error_message: recoveries.append(
+            (run_id, lease_token, error_message)
+        )
+        or True,
+        shutdown_grace_seconds=1.0,
+    )
+
+    manager.start()
+    progress = manager.run_one_iteration()
+    slot = manager.worker_slots[0]
+
+    manager.shutdown()
+
+    assert progress is True
+    assert isinstance(
+        slot.assignment_queue.puts[0], lecture_video_processing.RunAssignment
+    )
+    assert slot.assignment_queue.puts[-1] is None
+    assert slot.process.terminate_called is True
+    assert slot.idle is True
+    assert slot.run_id is None
+    assert slot.lease_token is None
+    assert recoveries == [
+        (
+            41,
+            "lease-41",
+            lecture_video_processing.UNEXPECTED_WORKER_EXIT_ERROR_MESSAGE,
+        )
+    ]
+
+
+def test_narration_worker_pool_manager_shutdown_drains_queued_worker_job_exception():
+    fake_context = FakeProcessContext()
+    recoveries: list[tuple[int, str, str]] = []
+    claims = iter([(51, "lease-51"), None])
+    manager = lecture_video_processing.NarrationWorkerPoolManager(
+        workers=1,
+        poll_interval_seconds=0.25,
+        process_context=fake_context,
+        claim_run_fn=lambda _runner_id: next(claims),
+        recover_run_fn=lambda run_id, lease_token, error_message: recoveries.append(
+            (run_id, lease_token, error_message)
+        )
+        or True,
+        shutdown_grace_seconds=1.0,
+    )
+
+    manager.start()
+    progress = manager.run_one_iteration()
+    slot = manager.worker_slots[0]
+    slot.process.exit_after_join = 0
+    manager.results_queue.put(
+        lecture_video_processing.WorkerJobException(
+            worker_slot=0,
+            run_id=51,
+            lease_token="lease-51",
+            error_message="boom",
+        )
+    )
+
+    manager.shutdown()
+
+    assert progress is True
+    assert slot.process.terminate_called is False
+    assert slot.idle is True
+    assert slot.run_id is None
+    assert slot.lease_token is None
+    assert recoveries == [(51, "lease-51", "boom")]
+
+
+def test_worker_pool_manager_run_shuts_down_if_signal_setup_fails(monkeypatch):
+    fake_context = FakeProcessContext()
+    manager = lecture_video_processing.NarrationWorkerPoolManager(
+        workers=1,
+        poll_interval_seconds=0.25,
+        process_context=fake_context,
+        claim_run_fn=lambda _runner_id: None,
+        recover_run_fn=lambda *_args: True,
+        shutdown_grace_seconds=1.0,
+    )
+    previous_sigint_handler = "previous-sigint"
+    previous_sigterm_handler = "previous-sigterm"
+    signal_calls: list[tuple[int, object]] = []
+
+    def fake_getsignal(signum: int) -> object:
+        if signum == signal.SIGINT:
+            return previous_sigint_handler
+        if signum == signal.SIGTERM:
+            return previous_sigterm_handler
+        raise AssertionError(f"Unexpected signal: {signum}")
+
+    def fake_signal(signum: int, handler: object) -> object:
+        signal_calls.append((signum, handler))
+        if signum == signal.SIGTERM and handler not in {
+            previous_sigint_handler,
+            previous_sigterm_handler,
+        }:
+            raise RuntimeError("install failed")
+        return handler
+
+    monkeypatch.setattr(worker_pool_module.signal, "getsignal", fake_getsignal)
+    monkeypatch.setattr(worker_pool_module.signal, "signal", fake_signal)
+
+    with pytest.raises(RuntimeError, match="install failed"):
+        manager.run()
+
+    slot = manager.worker_slots[0]
+    assert len(fake_context.processes) == 1
+    assert slot.assignment_queue.puts[-1] is None
+    assert slot.process.terminate_called is True
+    assert signal_calls[0][0] == signal.SIGINT
+    assert callable(signal_calls[0][1])
+    assert signal_calls[1][0] == signal.SIGTERM
+    assert callable(signal_calls[1][1])
+    assert signal_calls[2] == (signal.SIGINT, previous_sigint_handler)
+    assert signal_calls[3] == (signal.SIGTERM, previous_sigterm_handler)
+
+
+def test_worker_pool_manager_run_skips_restoring_unknown_signal_handlers(monkeypatch):
+    fake_context = FakeProcessContext()
+    manager = lecture_video_processing.NarrationWorkerPoolManager(
+        workers=1,
+        poll_interval_seconds=0.25,
+        process_context=fake_context,
+        claim_run_fn=lambda _runner_id: None,
+        recover_run_fn=lambda *_args: True,
+        shutdown_grace_seconds=1.0,
+    )
+    signal_calls: list[tuple[int, object]] = []
+
+    monkeypatch.setattr(worker_pool_module.signal, "getsignal", lambda _signum: None)
+
+    def fake_signal(signum: int, handler: object) -> object:
+        assert handler is not None
+        signal_calls.append((signum, handler))
+        return handler
+
+    def fake_run_one_iteration() -> bool:
+        manager.request_stop()
+        return True
+
+    monkeypatch.setattr(worker_pool_module.signal, "signal", fake_signal)
+    monkeypatch.setattr(manager, "run_one_iteration", fake_run_one_iteration)
+
+    manager.run()
+
+    assert len(fake_context.processes) == 1
+    assert len(signal_calls) == 2
+    assert signal_calls[0][0] == signal.SIGINT
+    assert callable(signal_calls[0][1])
+    assert signal_calls[1][0] == signal.SIGTERM
+    assert callable(signal_calls[1][1])
+
+
+def test_run_lecture_video_worker_cli_starts_health_server_and_passes_pool_settings(
+    monkeypatch,
+):
+    runner = CliRunner()
+    seen: dict[str, object] = {}
+
+    class FakeServer:
+        @contextmanager
+        def run_in_thread(self):
+            seen["server_started"] = True
+            yield
+
+    def fake_get_server(host="localhost", port=8001):
+        seen["host"] = host
+        seen["port"] = port
+        return FakeServer()
+
+    def fake_worker_pool(*, poll_interval_seconds: float, workers: int) -> None:
+        seen["poll_interval_seconds"] = poll_interval_seconds
+        seen["workers"] = workers
+
+    monkeypatch.setattr(cli_module, "get_server", fake_get_server)
+    monkeypatch.setattr(
+        lecture_video_processing,
+        "run_narration_processing_worker_pool",
+        fake_worker_pool,
+    )
+
+    result = runner.invoke(
+        cli_module.cli,
+        [
+            "lecture-video",
+            "run-worker",
+            "--host",
+            "0.0.0.0",
+            "--port",
+            "8123",
+            "--poll-interval",
+            "0.25",
+            "--workers",
+            "3",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert seen == {
+        "host": "0.0.0.0",
+        "port": 8123,
+        "poll_interval_seconds": 0.25,
+        "workers": 3,
+        "server_started": True,
+    }
+
+
+@with_institution(11, "Test Institution")
+async def test_recover_failed_narration_run_marks_run_video_and_processing_narration_failed(
+    db, institution
+):
+    async with db.async_session() as session:
+        (
+            _class_,
+            lecture_video,
+            _assistant,
+            run,
+        ) = await create_processing_lecture_video_assistant(session, institution)
+        assert run is not None
+
+    claim = await lecture_video_processing._claim_next_narration_run(
+        leased_by="test-runner"
+    )
+    assert claim is not None
+    run_id, lease_token = claim
+    assert run_id == run.id
+
+    state, payload = await lecture_video_processing._prepare_next_work_item(
+        run_id,
+        lease_token,
+    )
+    assert state == "work"
+    assert isinstance(payload, lecture_video_processing.NarrationWorkItem)
+
+    recovered = await lecture_video_processing.recover_failed_narration_run(
+        run_id,
+        lease_token,
+        error_message=lecture_video_processing.UNEXPECTED_WORKER_EXIT_ERROR_MESSAGE,
+    )
+
+    assert recovered is True
+
+    async with db.async_session() as session:
+        refreshed_video = await models.LectureVideo.get_by_id_with_copy_context(
+            session, lecture_video.id
+        )
+        refreshed_run = await models.LectureVideoProcessingRun.get_by_id(
+            session, run.id
+        )
+        narrations = list(
+            (
+                await session.scalars(
+                    select(models.LectureVideoNarration).order_by(
+                        models.LectureVideoNarration.id.asc()
+                    )
+                )
+            ).all()
+        )
+
+    assert refreshed_video is not None
+    assert refreshed_video.status == schemas.LectureVideoStatus.FAILED
+    assert (
+        refreshed_video.error_message
+        == lecture_video_processing.UNEXPECTED_WORKER_EXIT_ERROR_MESSAGE
+    )
+    assert refreshed_run is not None
+    assert refreshed_run.status == schemas.LectureVideoProcessingRunStatus.FAILED
+    assert (
+        refreshed_run.error_message
+        == lecture_video_processing.UNEXPECTED_WORKER_EXIT_ERROR_MESSAGE
+    )
+    assert refreshed_run.lease_token is None
+    assert refreshed_run.leased_by is None
+    assert refreshed_run.lease_expires_at is None
+    assert narrations[0].status == schemas.LectureVideoNarrationStatus.FAILED
+    assert (
+        narrations[0].error_message
+        == lecture_video_processing.UNEXPECTED_WORKER_EXIT_ERROR_MESSAGE
+    )
+    assert narrations[1].status == schemas.LectureVideoNarrationStatus.PENDING
+    assert narrations[2].status == schemas.LectureVideoNarrationStatus.PENDING
+
+
+@with_institution(11, "Test Institution")
+async def test_recover_failed_narration_run_ignores_stale_lease_token(db, institution):
+    async with db.async_session() as session:
+        (
+            _class_,
+            _lecture_video,
+            _assistant,
+            run,
+        ) = await create_processing_lecture_video_assistant(session, institution)
+        assert run is not None
+
+    claim = await lecture_video_processing._claim_next_narration_run(
+        leased_by="test-runner"
+    )
+    assert claim is not None
+    run_id, lease_token = claim
+
+    recovered = await lecture_video_processing.recover_failed_narration_run(
+        run_id,
+        "stale-token",
+        error_message=lecture_video_processing.UNEXPECTED_WORKER_EXIT_ERROR_MESSAGE,
+    )
+
+    assert recovered is False
+
+    async with db.async_session() as session:
+        refreshed_run = await models.LectureVideoProcessingRun.get_by_id(
+            session, run.id
+        )
+
+    assert refreshed_run is not None
+    assert refreshed_run.status == schemas.LectureVideoProcessingRunStatus.RUNNING
+    assert refreshed_run.lease_token == lease_token
+
+
+@with_institution(11, "Test Institution")
+async def test_recover_failed_narration_run_completes_when_final_narration_was_already_attached(
+    db, institution
+):
+    async with db.async_session() as session:
+        (
+            _class_,
+            lecture_video,
+            _assistant,
+            run,
+        ) = await create_processing_lecture_video_assistant(
+            session,
+            institution,
+            manifest=lecture_video_manifest(
+                intro_text="Only narration",
+                post_answer_texts=("", ""),
+            ),
+        )
+        assert run is not None
+
+    claim = await lecture_video_processing._claim_next_narration_run(
+        leased_by="test-runner"
+    )
+    assert claim is not None
+    run_id, lease_token = claim
+    assert run_id == run.id
+
+    state, payload = await lecture_video_processing._prepare_next_work_item(
+        run_id,
+        lease_token,
+    )
+    assert state == "work"
+    assert isinstance(payload, lecture_video_processing.NarrationWorkItem)
+
+    attached = await lecture_video_processing._attach_stored_audio_to_narration(
+        run_id,
+        lease_token,
+        payload.narration_id,
+        "audio/ogg",
+        len(b"final-audio"),
+        "recover-final-ready.ogg",
+    )
+    assert attached is True
+
+    recovered = await lecture_video_processing.recover_failed_narration_run(
+        run_id,
+        lease_token,
+        error_message=lecture_video_processing.UNEXPECTED_WORKER_EXIT_ERROR_MESSAGE,
+    )
+
+    assert recovered is True
+
+    async with db.async_session() as session:
+        refreshed_video = await models.LectureVideo.get_by_id_with_copy_context(
+            session, lecture_video.id
+        )
+        refreshed_run = await models.LectureVideoProcessingRun.get_by_id(
+            session, run.id
+        )
+
+    assert refreshed_video is not None
+    assert refreshed_video.status == schemas.LectureVideoStatus.READY
+    assert refreshed_video.error_message is None
+    assert refreshed_run is not None
+    assert refreshed_run.status == schemas.LectureVideoProcessingRunStatus.COMPLETED
+    assert refreshed_run.error_message is None
+    assert refreshed_video.questions[0].intro_narration is not None
+    assert refreshed_video.questions[0].intro_narration.status == (
+        schemas.LectureVideoNarrationStatus.READY
+    )
+    assert refreshed_video.questions[0].intro_narration.error_message is None
+    assert refreshed_video.questions[0].intro_narration.stored_object is not None
+
+
+@with_institution(11, "Test Institution")
+async def test_mark_run_failed_ignores_stale_lease_token(db, institution):
+    async with db.async_session() as session:
+        (
+            _class_,
+            lecture_video,
+            _assistant,
+            run,
+        ) = await create_processing_lecture_video_assistant(session, institution)
+        assert run is not None
+        loaded_lecture_video = await models.LectureVideo.get_by_id_with_copy_context(
+            session, lecture_video.id
+        )
+        assert loaded_lecture_video is not None
+        intro_narration = loaded_lecture_video.questions[0].intro_narration
+        assert intro_narration is not None
+        narration_id = intro_narration.id
+
+    first_claim = await lecture_video_processing._claim_next_narration_run(
+        leased_by="test-runner-1"
+    )
+    assert first_claim is not None
+    run_id, original_lease_token = first_claim
+
+    async with db.async_session() as session:
+        refreshed_run = await models.LectureVideoProcessingRun.get_by_id(
+            session, run.id
+        )
+        assert refreshed_run is not None
+        refreshed_run.lease_expires_at = datetime.now(UTC) - timedelta(seconds=1)
+        session.add(refreshed_run)
+        await session.commit()
+
+    second_claim = await lecture_video_processing._claim_next_narration_run(
+        leased_by="test-runner-2"
+    )
+    assert second_claim is not None
+    reclaimed_run_id, reclaimed_lease_token = second_claim
+    assert reclaimed_run_id == run_id
+    assert reclaimed_lease_token != original_lease_token
+
+    await lecture_video_processing._mark_run_failed(
+        run_id,
+        original_lease_token,
+        narration_id,
+        "stale failure",
+    )
+
+    async with db.async_session() as session:
+        refreshed_run = await models.LectureVideoProcessingRun.get_by_id(
+            session, run.id
+        )
+        refreshed_lecture_video = await models.LectureVideo.get_by_id(
+            session, lecture_video.id
+        )
+        refreshed_narration = await models.LectureVideoNarration.get_by_id(
+            session, narration_id
+        )
+
+    assert refreshed_run is not None
+    assert refreshed_run.status == schemas.LectureVideoProcessingRunStatus.RUNNING
+    assert refreshed_run.lease_token == reclaimed_lease_token
+    assert refreshed_lecture_video is not None
+    assert refreshed_lecture_video.status == schemas.LectureVideoStatus.PROCESSING
+    assert refreshed_lecture_video.error_message is None
+    assert refreshed_narration is not None
+    assert refreshed_narration.status == schemas.LectureVideoNarrationStatus.PENDING
+    assert refreshed_narration.error_message is None
+
+
+@with_institution(11, "Test Institution")
+async def test_process_claimed_narration_run_renews_lease_during_synthesis(
+    db, institution, config, monkeypatch, tmp_path
+):
+    narration_dir = tmp_path / "narration-audio"
+    monkeypatch.setattr(
+        config,
+        "lecture_video_audio_store",
+        LocalAudioStoreSettings(save_target=str(narration_dir)),
+    )
+    monkeypatch.setattr(
+        lecture_video_processing,
+        "RUN_LEASE_HEARTBEAT_INTERVAL",
+        timedelta(milliseconds=10),
+    )
+
+    synthesis_started = asyncio.Event()
+    release_synthesis = asyncio.Event()
+
+    async def slow_synthesis(*_args, **_kwargs):
+        synthesis_started.set()
+        await release_synthesis.wait()
+        return ("audio/ogg", b"fake-opus-audio")
+
+    monkeypatch.setattr(
+        lecture_video_processing,
+        "synthesize_elevenlabs_speech",
+        slow_synthesis,
+    )
+
+    async with db.async_session() as session:
+        (
+            _class_,
+            lecture_video,
+            _assistant,
+            run,
+        ) = await create_processing_lecture_video_assistant(session, institution)
+        assert run is not None
+
+    claim = await lecture_video_processing._claim_next_narration_run(
+        leased_by="test-runner-1"
+    )
+    assert claim is not None
+    run_id, lease_token = claim
+
+    process_task = asyncio.create_task(
+        lecture_video_processing._process_claimed_narration_run(run_id, lease_token)
+    )
+    try:
+        await synthesis_started.wait()
+
+        async with db.async_session() as session:
+            refreshed_run = await models.LectureVideoProcessingRun.get_by_id(
+                session, run.id
+            )
+            assert refreshed_run is not None
+            refreshed_run.lease_expires_at = datetime.now(UTC) - timedelta(seconds=1)
+            session.add(refreshed_run)
+            await session.commit()
+
+        for _ in range(20):
+            await asyncio.sleep(0.01)
+            async with db.async_session() as session:
+                refreshed_run = await models.LectureVideoProcessingRun.get_by_id(
+                    session, run.id
+                )
+            lease_expires_at = (
+                refreshed_run.lease_expires_at if refreshed_run is not None else None
+            )
+            if lease_expires_at is not None and lease_expires_at.tzinfo is None:
+                lease_expires_at = lease_expires_at.replace(tzinfo=UTC)
+            if (
+                refreshed_run is not None
+                and refreshed_run.lease_token == lease_token
+                and lease_expires_at is not None
+                and lease_expires_at > datetime.now(UTC)
+            ):
+                break
+        else:
+            pytest.fail("Expected the in-flight synthesis to renew the run lease.")
+
+        second_claim = await lecture_video_processing._claim_next_narration_run(
+            leased_by="test-runner-2"
+        )
+        assert second_claim is None
+    finally:
+        release_synthesis.set()
+        await asyncio.wait_for(process_task, timeout=1)
+
+    async with db.async_session() as session:
+        refreshed_run = await models.LectureVideoProcessingRun.get_by_id(
+            session, run.id
+        )
+        refreshed_video = await models.LectureVideo.get_by_id(session, lecture_video.id)
+
+    assert refreshed_run is not None
+    assert refreshed_run.status == schemas.LectureVideoProcessingRunStatus.COMPLETED
+    assert refreshed_video is not None
+    assert refreshed_video.status == schemas.LectureVideoStatus.READY
+
+
+@with_institution(11, "Test Institution")
+async def test_prepare_next_work_item_returns_none_narration_id_when_voice_configuration_missing(
+    db, institution
+):
+    async with db.async_session() as session:
+        (
+            _class_,
+            lecture_video,
+            _assistant,
+            run,
+        ) = await create_processing_lecture_video_assistant(session, institution)
+        assert run is not None
+        lecture_video.voice_id = None
+        session.add(lecture_video)
+        await session.commit()
+
+    claim = await lecture_video_processing._claim_next_narration_run(
+        leased_by="test-runner"
+    )
+    assert claim is not None
+    run_id, lease_token = claim
+
+    state, payload = await lecture_video_processing._prepare_next_work_item(
+        run_id,
+        lease_token,
+    )
+
+    assert state == "failed"
+    assert payload == (None, "Lecture video voice configuration is missing.")
+
+
+@with_institution(11, "Test Institution")
+async def test_delete_lecture_video_cancels_processing_run_and_preserves_history(
+    db, institution
+):
+    async with db.async_session() as session:
+        (
+            class_,
+            lecture_video,
+            assistant,
+            run,
+        ) = await create_processing_lecture_video_assistant(session, institution)
+        assert run is not None
+        assistant = await session.get(models.Assistant, assistant.id)
+        assert assistant is not None
+        assistant.lecture_video_id = None
+        session.add(assistant)
+        await session.flush()
+
+        await lecture_video_service.delete_lecture_video(session, lecture_video.id)
+        await session.commit()
+
+    async with db.async_session() as session:
+        deleted_video = await session.get(models.LectureVideo, lecture_video.id)
+        refreshed_run = await models.LectureVideoProcessingRun.get_by_id(
+            session, run.id
+        )
+
+    assert deleted_video is None
+    assert refreshed_run is not None
+    assert refreshed_run.lecture_video_id is None
+    assert refreshed_run.lecture_video_id_snapshot == lecture_video.id
+    assert refreshed_run.status == schemas.LectureVideoProcessingRunStatus.CANCELLED
+    assert (
+        refreshed_run.cancel_reason
+        == schemas.LectureVideoProcessingCancelReason.LECTURE_VIDEO_DELETED
+    )
 
 
 def test_lecture_video_config_matches_logs_invalid_current_manifest(
@@ -4516,6 +5807,15 @@ async def test_update_assistant_with_same_lecture_video_id_clones_snapshot_and_p
         updated_video = await session.get(
             models.LectureVideo, assistant.lecture_video_id
         )
+        processing_runs = list(
+            (
+                await session.scalars(
+                    select(models.LectureVideoProcessingRun).order_by(
+                        models.LectureVideoProcessingRun.id.asc()
+                    )
+                )
+            ).all()
+        )
         original_question = await session.scalar(
             select(models.LectureVideoQuestion.question_text).where(
                 models.LectureVideoQuestion.lecture_video_id == lecture_video.id
@@ -4532,10 +5832,19 @@ async def test_update_assistant_with_same_lecture_video_id_clones_snapshot_and_p
     assert updated_video is not None
     assert updated_video.id != original_video.id
     assert updated_video.stored_object_id == original_video.stored_object_id
+    assert updated_video.source_lecture_video_id_snapshot == original_video.id
+    assert original_video.source_lecture_video_id_snapshot is None
     assert updated_video.voice_id == "voice-updated"
     assert original_video.voice_id == DEFAULT_LECTURE_VIDEO_VOICE_ID
     assert original_question == "Original question?"
     assert updated_question == "Updated question?"
+    assert len(processing_runs) == 2
+    assert processing_runs[0].lecture_video_id_snapshot == original_video.id
+    assert (
+        processing_runs[0].status == schemas.LectureVideoProcessingRunStatus.CANCELLED
+    )
+    assert processing_runs[1].lecture_video_id_snapshot == updated_video.id
+    assert processing_runs[1].status == schemas.LectureVideoProcessingRunStatus.QUEUED
 
 
 @with_user(123)
@@ -4826,6 +6135,459 @@ async def test_update_lecture_video_assistant_rejects_assigned_lecture_video(
 @with_institution(11, "Test Institution")
 @with_authz(
     grants=[
+        ("user:123", "admin", "class:1"),
+        ("user:123", "can_create_assistants", "class:1"),
+        ("user:123", "can_edit", "assistant:1"),
+    ]
+)
+async def test_retry_lecture_video_endpoint_resets_non_ready_narrations_and_queues_new_attempt(
+    api, db, institution, valid_user_token, config, monkeypatch, tmp_path
+):
+    narration_dir = tmp_path / "retry-narrations"
+    monkeypatch.setattr(
+        config,
+        "lecture_video_audio_store",
+        LocalAudioStoreSettings(save_target=str(narration_dir)),
+    )
+
+    async with db.async_session() as session:
+        class_, lecture_video, assistant = await create_ready_lecture_video_assistant(
+            session,
+            institution,
+        )
+        lecture_video = await models.LectureVideo.get_by_id_with_copy_context(
+            session, lecture_video.id
+        )
+        assert lecture_video is not None
+        ready_narration = lecture_video.questions[0].intro_narration
+        failed_narration = lecture_video.questions[0].options[0].post_narration
+        other_ready = lecture_video.questions[0].options[1].post_narration
+        assert ready_narration is not None
+        assert failed_narration is not None
+        assert other_ready is not None
+        assert ready_narration.stored_object is not None
+        assert failed_narration.stored_object is not None
+        assert other_ready.stored_object is not None
+        (narration_dir / ready_narration.stored_object.key).parent.mkdir(
+            parents=True, exist_ok=True
+        )
+        (narration_dir / ready_narration.stored_object.key).write_bytes(b"ready-audio")
+        (narration_dir / failed_narration.stored_object.key).write_bytes(
+            b"failed-audio"
+        )
+
+        preserved_ready_stored_object_id = ready_narration.stored_object.id
+        preserved_other_ready_stored_object_id = other_ready.stored_object.id
+        failed_audio_key = failed_narration.stored_object.key
+
+        failed_narration.status = schemas.LectureVideoNarrationStatus.FAILED
+        failed_narration.error_message = "Server Error from ElevenLabs"
+        lecture_video.status = schemas.LectureVideoStatus.FAILED
+        lecture_video.error_message = "Server Error from ElevenLabs"
+        session.add(failed_narration)
+        session.add(lecture_video)
+        await models.LectureVideoProcessingRun.create(
+            session,
+            lecture_video_id=lecture_video.id,
+            lecture_video_id_snapshot=lecture_video.id,
+            class_id=class_.id,
+            assistant_id_at_start=assistant.id,
+            stage=schemas.LectureVideoProcessingStage.NARRATION,
+            attempt_number=1,
+            status=schemas.LectureVideoProcessingRunStatus.FAILED,
+        )
+        await session.commit()
+
+    response = api.post(
+        "/api/v1/class/1/assistant/1/lecture-video/retry",
+        headers={"Authorization": f"Bearer {valid_user_token}"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == schemas.LectureVideoStatus.PROCESSING.value
+    assert response.json()["error_message"] is None
+
+    async with db.async_session() as session:
+        refreshed_video = await models.LectureVideo.get_by_id_with_copy_context(
+            session, lecture_video.id
+        )
+        refreshed_runs = list(
+            (
+                await session.scalars(
+                    select(models.LectureVideoProcessingRun)
+                    .where(
+                        models.LectureVideoProcessingRun.lecture_video_id_snapshot
+                        == lecture_video.id
+                    )
+                    .order_by(models.LectureVideoProcessingRun.attempt_number.asc())
+                )
+            ).all()
+        )
+
+    assert refreshed_video is not None
+    assert refreshed_video.status == schemas.LectureVideoStatus.PROCESSING
+    assert refreshed_video.error_message is None
+    assert refreshed_video.questions[0].intro_narration is not None
+    assert refreshed_video.questions[0].intro_narration.status == (
+        schemas.LectureVideoNarrationStatus.READY
+    )
+    assert (
+        refreshed_video.questions[0].intro_narration.stored_object_id
+        == preserved_ready_stored_object_id
+    )
+    assert refreshed_video.questions[0].options[1].post_narration is not None
+    assert (
+        refreshed_video.questions[0].options[1].post_narration.stored_object_id
+        == preserved_other_ready_stored_object_id
+    )
+    assert refreshed_video.questions[0].options[0].post_narration is not None
+    assert refreshed_video.questions[0].options[0].post_narration.status == (
+        schemas.LectureVideoNarrationStatus.PENDING
+    )
+    assert (
+        refreshed_video.questions[0].options[0].post_narration.stored_object_id is None
+    )
+    assert refreshed_runs[0].status == schemas.LectureVideoProcessingRunStatus.FAILED
+    assert refreshed_runs[1].status == schemas.LectureVideoProcessingRunStatus.QUEUED
+    assert refreshed_runs[1].attempt_number == 2
+    assert not (narration_dir / failed_audio_key).exists()
+
+
+@with_institution(11, "Test Institution")
+async def test_queue_narration_processing_run_retries_integrity_error_with_new_attempt_number(
+    db, institution, monkeypatch
+):
+    async with db.async_session() as session:
+        class_ = models.Class(
+            id=1,
+            name="Lecture Class",
+            institution_id=institution.id,
+            api_key="sk-test",
+        )
+        lecture_video = make_lecture_video(
+            class_.id,
+            "retry-attempt.webm",
+            filename="retry-attempt.webm",
+            status=schemas.LectureVideoStatus.PROCESSING.value,
+        )
+        assistant = models.Assistant(
+            id=1,
+            name="Lecture Assistant",
+            class_id=class_.id,
+            interaction_mode=schemas.InteractionMode.LECTURE_VIDEO,
+            version=3,
+            lecture_video=lecture_video,
+            instructions="You are a lecture assistant.",
+            model="gpt-4o-mini",
+            tools="[]",
+            use_latex=False,
+            use_image_descriptions=False,
+            hide_prompt=False,
+        )
+        session.add_all([class_, lecture_video, assistant])
+        await session.flush()
+
+        original_create = models.LectureVideoProcessingRun.create
+        create_attempt_numbers: list[int] = []
+        latest_attempt_numbers = iter([1, 2])
+
+        async def fake_get_latest_attempt_number(
+            session_, lecture_video_id_snapshot, stage
+        ):
+            assert session_ is session
+            assert lecture_video_id_snapshot == lecture_video.id
+            assert stage == schemas.LectureVideoProcessingStage.NARRATION
+            return next(latest_attempt_numbers)
+
+        async def fake_create(session_, **kwargs):
+            assert session_ is session
+            create_attempt_numbers.append(kwargs["attempt_number"])
+            if len(create_attempt_numbers) == 1:
+                raise IntegrityError(
+                    "INSERT INTO lecture_video_processing_runs (...) VALUES (...)",
+                    {},
+                    Exception(
+                        "UNIQUE constraint failed: "
+                        "lecture_video_processing_runs.lecture_video_id_snapshot, "
+                        "lecture_video_processing_runs.stage, "
+                        "lecture_video_processing_runs.attempt_number"
+                    ),
+                )
+            return await original_create(session_, **kwargs)
+
+        monkeypatch.setattr(
+            models.LectureVideoProcessingRun,
+            "get_latest_attempt_number",
+            fake_get_latest_attempt_number,
+        )
+        monkeypatch.setattr(models.LectureVideoProcessingRun, "create", fake_create)
+
+        run = await lecture_video_processing.queue_narration_processing_run(
+            session,
+            lecture_video,
+            assistant_id_at_start=assistant.id,
+        )
+        await session.commit()
+
+    assert create_attempt_numbers == [2, 3]
+    assert run.attempt_number == 3
+
+    async with db.async_session() as session:
+        persisted_assistant = await models.Assistant.get_by_id(session, assistant.id)
+        persisted_run = await models.LectureVideoProcessingRun.get_by_id(
+            session, run.id
+        )
+
+    assert persisted_assistant is not None
+    assert persisted_run is not None
+    assert persisted_run.attempt_number == 3
+
+
+@with_institution(11, "Test Institution")
+async def test_queue_narration_processing_run_returns_existing_run_after_concurrent_queue_conflict(
+    db, institution, monkeypatch
+):
+    async with db.async_session() as session:
+        class_ = models.Class(
+            id=1,
+            name="Lecture Class",
+            institution_id=institution.id,
+            api_key="sk-test",
+        )
+        lecture_video = make_lecture_video(
+            class_.id,
+            "retry-existing-run.webm",
+            filename="retry-existing-run.webm",
+            status=schemas.LectureVideoStatus.PROCESSING.value,
+        )
+        assistant = models.Assistant(
+            id=1,
+            name="Lecture Assistant",
+            class_id=class_.id,
+            interaction_mode=schemas.InteractionMode.LECTURE_VIDEO,
+            version=3,
+            lecture_video=lecture_video,
+            instructions="You are a lecture assistant.",
+            model="gpt-4o-mini",
+            tools="[]",
+            use_latex=False,
+            use_image_descriptions=False,
+            hide_prompt=False,
+        )
+        session.add_all([class_, lecture_video, assistant])
+        await session.flush()
+
+        existing_run = models.LectureVideoProcessingRun(
+            id=99,
+            lecture_video_id=lecture_video.id,
+            lecture_video_id_snapshot=lecture_video.id,
+            class_id=class_.id,
+            assistant_id_at_start=assistant.id,
+            stage=schemas.LectureVideoProcessingStage.NARRATION,
+            attempt_number=2,
+            status=schemas.LectureVideoProcessingRunStatus.QUEUED,
+        )
+
+        create_calls = 0
+        non_terminal_calls = 0
+
+        async def fake_create(session_, **kwargs):
+            nonlocal create_calls
+            assert session_ is session
+            create_calls += 1
+            raise IntegrityError(
+                "INSERT INTO lecture_video_processing_runs (...) VALUES (...)",
+                {},
+                Exception(
+                    "UNIQUE constraint failed: "
+                    "lecture_video_processing_runs.lecture_video_id_snapshot, "
+                    "lecture_video_processing_runs.stage"
+                ),
+            )
+
+        async def fake_get_non_terminal_by_snapshot_stage(
+            session_, lecture_video_id_snapshot, stage
+        ):
+            nonlocal non_terminal_calls
+            assert session_ is session
+            assert lecture_video_id_snapshot == lecture_video.id
+            assert stage == schemas.LectureVideoProcessingStage.NARRATION
+            non_terminal_calls += 1
+            if non_terminal_calls == 1:
+                return None
+            return existing_run
+
+        latest_attempt_number = AsyncMock(return_value=1)
+
+        monkeypatch.setattr(models.LectureVideoProcessingRun, "create", fake_create)
+        monkeypatch.setattr(
+            models.LectureVideoProcessingRun,
+            "get_non_terminal_by_snapshot_stage",
+            fake_get_non_terminal_by_snapshot_stage,
+        )
+        monkeypatch.setattr(
+            models.LectureVideoProcessingRun,
+            "get_latest_attempt_number",
+            latest_attempt_number,
+        )
+
+        run = await lecture_video_processing.queue_narration_processing_run(
+            session,
+            lecture_video,
+            assistant_id_at_start=assistant.id,
+        )
+
+    assert run is existing_run
+    assert create_calls == 1
+    assert non_terminal_calls == 2
+    latest_attempt_number.assert_awaited_once()
+
+
+@with_user(123)
+@with_institution(11, "Test Institution")
+@with_authz(
+    grants=[
+        ("user:123", "admin", "class:1"),
+        ("user:123", "can_create_assistants", "class:1"),
+        ("user:123", "can_edit", "assistant:1"),
+    ]
+)
+async def test_retry_lecture_video_endpoint_returns_conflict_when_requeue_fails(
+    api, db, institution, valid_user_token, monkeypatch
+):
+    async with db.async_session() as session:
+        class_, lecture_video, assistant = await create_ready_lecture_video_assistant(
+            session,
+            institution,
+        )
+        lecture_video = await models.LectureVideo.get_by_id_with_copy_context(
+            session, lecture_video.id
+        )
+        assert lecture_video is not None
+        ready_narration = lecture_video.questions[0].intro_narration
+        failed_narration = lecture_video.questions[0].options[0].post_narration
+        other_ready = lecture_video.questions[0].options[1].post_narration
+        assert ready_narration is not None
+        assert failed_narration is not None
+        assert other_ready is not None
+        assert ready_narration.stored_object is not None
+        assert failed_narration.stored_object is not None
+        assert other_ready.stored_object is not None
+
+        preserved_ready_stored_object_id = ready_narration.stored_object.id
+        preserved_other_ready_stored_object_id = other_ready.stored_object.id
+        failed_stored_object_id = failed_narration.stored_object.id
+        failed_narration.status = schemas.LectureVideoNarrationStatus.FAILED
+        failed_narration.error_message = "Server Error from ElevenLabs"
+        lecture_video.status = schemas.LectureVideoStatus.FAILED
+        lecture_video.error_message = "Server Error from ElevenLabs"
+        session.add(failed_narration)
+        session.add(lecture_video)
+        await models.LectureVideoProcessingRun.create(
+            session,
+            lecture_video_id=lecture_video.id,
+            lecture_video_id_snapshot=lecture_video.id,
+            class_id=class_.id,
+            assistant_id_at_start=assistant.id,
+            stage=schemas.LectureVideoProcessingStage.NARRATION,
+            attempt_number=1,
+            status=schemas.LectureVideoProcessingRunStatus.FAILED,
+        )
+        await session.commit()
+
+    monkeypatch.setattr(
+        lecture_video_processing,
+        "queue_narration_processing_run",
+        AsyncMock(return_value=None),
+    )
+
+    response = api.post(
+        "/api/v1/class/1/assistant/1/lecture-video/retry",
+        headers={"Authorization": f"Bearer {valid_user_token}"},
+    )
+
+    assert response.status_code == 409
+    assert (
+        response.json()["detail"]
+        == "Lecture video retry is no longer available because the assistant or lecture video configuration changed."
+    )
+
+    async with db.async_session() as session:
+        refreshed_video = await models.LectureVideo.get_by_id_with_copy_context(
+            session, lecture_video.id
+        )
+        refreshed_runs = list(
+            (
+                await session.scalars(
+                    select(models.LectureVideoProcessingRun)
+                    .where(
+                        models.LectureVideoProcessingRun.lecture_video_id_snapshot
+                        == lecture_video.id
+                    )
+                    .order_by(models.LectureVideoProcessingRun.attempt_number.asc())
+                )
+            ).all()
+        )
+
+    assert refreshed_video is not None
+    assert refreshed_video.status == schemas.LectureVideoStatus.FAILED
+    assert refreshed_video.error_message == "Server Error from ElevenLabs"
+    assert refreshed_video.questions[0].intro_narration is not None
+    assert (
+        refreshed_video.questions[0].intro_narration.stored_object_id
+        == preserved_ready_stored_object_id
+    )
+    assert refreshed_video.questions[0].options[1].post_narration is not None
+    assert (
+        refreshed_video.questions[0].options[1].post_narration.stored_object_id
+        == preserved_other_ready_stored_object_id
+    )
+    assert refreshed_video.questions[0].options[0].post_narration is not None
+    assert refreshed_video.questions[0].options[0].post_narration.status == (
+        schemas.LectureVideoNarrationStatus.FAILED
+    )
+    assert refreshed_video.questions[0].options[0].post_narration.error_message == (
+        "Server Error from ElevenLabs"
+    )
+    assert (
+        refreshed_video.questions[0].options[0].post_narration.stored_object_id
+        == failed_stored_object_id
+    )
+    assert len(refreshed_runs) == 1
+    assert refreshed_runs[0].status == schemas.LectureVideoProcessingRunStatus.FAILED
+    assert refreshed_runs[0].attempt_number == 1
+
+
+@with_user(123)
+@with_institution(11, "Test Institution")
+@with_authz(
+    grants=[
+        ("user:123", "can_create_assistants", "class:1"),
+        ("user:123", "can_edit", "assistant:1"),
+    ]
+)
+async def test_copy_lecture_video_assistant_rejects_non_ready_source(
+    api, db, institution, valid_user_token
+):
+    async with db.async_session() as session:
+        await create_processing_lecture_video_assistant(session, institution)
+
+    response = api.post(
+        "/api/v1/class/1/assistant/1/copy",
+        headers={"Authorization": f"Bearer {valid_user_token}"},
+    )
+
+    assert response.status_code == 409
+    assert (
+        response.json()["detail"]
+        == "Lecture video assistants can only be copied after narration processing is ready."
+    )
+
+
+@with_user(123)
+@with_institution(11, "Test Institution")
+@with_authz(
+    grants=[
         ("user:123", "can_create_assistants", "class:1"),
         ("user:123", "can_edit", "assistant:1"),
     ]
@@ -4889,6 +6651,7 @@ async def test_copy_lecture_video_assistant_within_class_clones_lecture_video_ro
     assert copied_video is not None
     assert copied_video.class_id == 1
     assert copied_video.stored_object_id == lecture_video.stored_object_id
+    assert copied_video.source_lecture_video_id_snapshot == lecture_video.id
 
 
 @with_user(123)
@@ -5009,6 +6772,7 @@ async def test_copy_lecture_video_assistant_to_other_class_clones_lecture_video_
     assert copied_assistant.lecture_video_id != lecture_video.id
     assert copied_video.class_id == 2
     assert copied_video.stored_object_id == lecture_video.stored_object_id
+    assert copied_video.source_lecture_video_id_snapshot == lecture_video.id
     assert copied_question == "Copied question?"
 
 
@@ -6069,6 +7833,54 @@ async def test_lecture_thread_returns_409_when_lecture_video_not_ready(
 
 @with_user(123)
 @with_institution(11, "Test Institution")
+@with_authz(grants=[("user:123", "can_create_thread", "class:1")])
+async def test_lecture_thread_returns_failed_specific_message_when_lecture_video_failed(
+    api, db, institution, valid_user_token
+):
+    async with db.async_session() as session:
+        class_ = models.Class(
+            id=1,
+            name="Test Class",
+            institution_id=institution.id,
+            api_key="test-key",
+        )
+        lecture_video = make_lecture_video(
+            class_.id,
+            "failed.mp4",
+            filename="failed.mp4",
+            status=schemas.LectureVideoStatus.FAILED.value,
+        )
+        lecture_video.error_message = "Server Error from ElevenLabs"
+        assistant = models.Assistant(
+            id=1,
+            name="Lecture Assistant",
+            class_id=class_.id,
+            interaction_mode=schemas.InteractionMode.LECTURE_VIDEO,
+            version=3,
+            lecture_video_id=1,
+            instructions="You are a lecture assistant.",
+        )
+        session.add(class_)
+        session.add(lecture_video)
+        await session.flush()
+        assistant.lecture_video_id = lecture_video.id
+        session.add(assistant)
+        await session.commit()
+
+    response = api.post(
+        "/api/v1/class/1/thread/lecture",
+        json={"assistant_id": 1},
+        headers={"Authorization": f"Bearer {valid_user_token}"},
+    )
+    assert response.status_code == 409
+    assert (
+        response.json()["detail"]
+        == "This assistant's lecture video narration processing failed. Edit the assistant and retry."
+    )
+
+
+@with_user(123)
+@with_institution(11, "Test Institution")
 @with_authz(
     grants=[
         ("user:123", "can_view", "thread:109"),
@@ -6287,7 +8099,7 @@ async def test_get_thread_lecture_video_narration_streams_audio(
     )
     assert response.status_code == 200
     assert response.content == narration_bytes
-    assert response.headers["content-type"].startswith("audio/mpeg")
+    assert response.headers["content-type"].startswith("audio/ogg")
 
     missing = api.get(
         f"/api/v1/class/{class_.id}/thread/{thread_id}/lecture-video/narration/99999",

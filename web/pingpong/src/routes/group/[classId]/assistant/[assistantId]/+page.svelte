@@ -16,7 +16,8 @@
 		ButtonGroup,
 		RadioButton,
 		InputAddon,
-		Tooltip
+		Tooltip,
+		Spinner
 	} from 'flowbite-svelte';
 	import type {
 		Tool,
@@ -55,7 +56,8 @@
 		ClapperboardPlaySolid,
 		ClapperboardPlayOutline,
 		CheckCircleOutline,
-		ExclamationCircleOutline
+		ExclamationCircleOutline,
+		RefreshOutline
 	} from 'flowbite-svelte-icons';
 	import MultiSelectWithUpload from '$lib/components/MultiSelectWithUpload.svelte';
 	import { writable, type Writable } from 'svelte/store';
@@ -209,6 +211,8 @@
 	let selectedLectureVideo: api.LectureVideoSummary | null = currentLectureVideo;
 	let lectureVideoDraftIds = new SvelteSet<number>();
 	let uploadingLectureVideo = false;
+	let refreshingLectureVideoStatus = false;
+	let canRefreshCurrentLectureVideoStatus = false;
 	let lectureVideoManifestJson = '';
 	let hasSetLectureVideoManifest = false;
 	let currentVoiceId = data.lectureVideoConfig?.voice_id || '';
@@ -1638,6 +1642,83 @@
 		target.value = '';
 	};
 
+	const syncLectureVideoSummary = (summary: api.LectureVideoSummary) => {
+		currentLectureVideo = { ...(currentLectureVideo || summary), ...summary };
+		if (selectedLectureVideo?.id === summary.id) {
+			selectedLectureVideo = { ...selectedLectureVideo, ...summary };
+		}
+	};
+	$: canRefreshCurrentLectureVideoStatus =
+		!data.isCreating &&
+		!!data.assistantId &&
+		!!currentLectureVideo &&
+		selectedLectureVideo?.id === currentLectureVideo.id;
+
+	const refreshAssistantLectureVideoStatus = async () => {
+		if (
+			data.isCreating ||
+			!data.assistantId ||
+			!currentLectureVideo ||
+			refreshingLectureVideoStatus
+		) {
+			return;
+		}
+
+		refreshingLectureVideoStatus = true;
+		try {
+			let response;
+			try {
+				response = await api.getAssistantLectureVideoConfig(fetch, data.class.id, data.assistantId);
+			} catch (error) {
+				sadToast(
+					`Could not refresh lecture video status:\n${
+						error instanceof Error ? error.message : error?.toString() || 'Unknown error'
+					}`
+				);
+				return;
+			}
+			const expanded = api.expandResponse(response);
+			if (expanded.error || !expanded.data?.lecture_video) {
+				sadToast(
+					`Could not refresh lecture video status:\n${expanded.error?.detail || 'Unknown error'}`
+				);
+				return;
+			}
+
+			syncLectureVideoSummary(expanded.data.lecture_video);
+		} finally {
+			refreshingLectureVideoStatus = false;
+		}
+	};
+
+	const retryLectureVideoProcessing = async () => {
+		if (data.isCreating || !data.assistantId || !currentLectureVideo) {
+			return;
+		}
+
+		let response;
+		try {
+			response = await api.retryAssistantLectureVideo(fetch, data.class.id, data.assistantId);
+		} catch (error) {
+			sadToast(
+				`Could not retry lecture video processing:\n${
+					error instanceof Error ? error.message : error?.toString() || 'Unknown error'
+				}`
+			);
+			return;
+		}
+		const expanded = api.expandResponse(response);
+		if (expanded.error || !expanded.data) {
+			sadToast(
+				`Could not retry lecture video processing:\n${expanded.error?.detail || 'Unknown error'}`
+			);
+			return;
+		}
+
+		syncLectureVideoSummary(expanded.data);
+		happyToast('Lecture video processing retried');
+	};
+
 	const validateLectureVideoVoice = async () => {
 		const trimmedVoiceId = voiceId.trim();
 		if (!trimmedVoiceId) {
@@ -1781,15 +1862,6 @@
 		}
 
 		if (params.interaction_mode === 'lecture_video') {
-			if (lectureVideoConfigLoadError) {
-				sadToast(
-					`Could not load the lecture video configuration:\n${lectureVideoConfigLoadErrorMessage}`
-				);
-				$loading = false;
-				$loadingMessage = '';
-				return;
-			}
-
 			if (uploadingLectureVideo) {
 				sadToast('Please wait for the lecture video upload to finish before saving.');
 				$loading = false;
@@ -2028,8 +2100,9 @@
 				<div>
 					<div class="text-sm font-semibold">Lecture video configuration could not be loaded</div>
 					<div class="mt-1 text-sm">
-						PingPong could not load this assistant&apos;s lecture video settings, so saving is
-						disabled until the configuration loads cleanly.
+						PingPong could not load this assistant&apos;s current lecture video settings. To repair
+						this assistant, upload a replacement lecture video, enter a valid manifest and voice ID,
+						then save.
 					</div>
 					<div class="mt-2 text-sm">{lectureVideoConfigLoadErrorMessage}</div>
 					{#if lectureVideoConfigLoadError.$status}
@@ -2302,28 +2375,52 @@
 								<div class="text-sm font-medium text-gray-900">
 									{selectedLectureVideo.filename}
 								</div>
+								<div class="inline-flex items-center gap-1 text-xs text-gray-500">
+									{selectedLectureVideo.status.charAt(0).toUpperCase() +
+										selectedLectureVideo.status.slice(1)}
+									{#if canRefreshCurrentLectureVideoStatus}
+										<button
+											type="button"
+											class="rounded-full p-0.5 text-gray-500 hover:text-gray-700 disabled:cursor-not-allowed disabled:opacity-50"
+											onclick={() => void refreshAssistantLectureVideoStatus()}
+											disabled={refreshingLectureVideoStatus}
+											aria-label="Refresh lecture video status"
+											title="Refresh lecture video status"
+										>
+											{#if refreshingLectureVideoStatus}
+												<Spinner color="gray" class="h-3 w-3" />
+											{:else}
+												<RefreshOutline class="h-3 w-3" />
+											{/if}
+										</button>
+									{/if}
+								</div>
 								{#if selectedLectureVideo.error_message}
 									<div class="text-xs text-red-600">{selectedLectureVideo.error_message}</div>
-								{:else}
-									<div class="text-xs text-gray-500">
-										{selectedLectureVideo.status.charAt(0).toUpperCase() +
-											selectedLectureVideo.status.slice(1)}
-									</div>
 								{/if}
 							</div>
 						</div>
-						{#if canUploadLectureVideo}
-							<label
-								class="cursor-pointer rounded-lg px-3 py-1.5 text-sm font-medium text-gray-600 hover:bg-gray-200"
-							>
-								Replace
-								<input
-									type="file"
-									accept="video/*"
-									class="hidden"
-									onchange={handleLectureVideoFileChange}
-								/>
-							</label>
+						{#if canUploadLectureVideo || (!data.isCreating && data.assistantId && currentLectureVideo && selectedLectureVideo?.id === currentLectureVideo.id && currentLectureVideo.status === 'failed')}
+							<div class="flex items-center gap-2">
+								{#if !data.isCreating && data.assistantId && currentLectureVideo && selectedLectureVideo?.id === currentLectureVideo.id && currentLectureVideo.status === 'failed'}
+									<Button color="light" size="xs" onclick={retryLectureVideoProcessing}>
+										Retry
+									</Button>
+								{/if}
+								{#if canUploadLectureVideo}
+									<label
+										class="cursor-pointer rounded-lg px-3 py-1.5 text-sm font-medium text-gray-600 hover:bg-gray-200"
+									>
+										Replace
+										<input
+											type="file"
+											accept="video/*"
+											class="hidden"
+											onchange={handleLectureVideoFileChange}
+										/>
+									</label>
+								{/if}
+							</div>
 						{/if}
 					</div>
 				{:else}
@@ -3633,11 +3730,8 @@
 				pill
 				class="border border-orange bg-orange text-white hover:bg-orange-dark"
 				type="submit"
-				disabled={$loading ||
-					uploadingFSPrivate ||
-					uploadingCIPrivate ||
-					uploadingLectureVideo ||
-					!!lectureVideoConfigLoadError}>Save</Button
+				disabled={$loading || uploadingFSPrivate || uploadingCIPrivate || uploadingLectureVideo}
+				>Save</Button
 			>
 			<Button
 				disabled={$loading || uploadingFSPrivate || uploadingCIPrivate || uploadingLectureVideo}

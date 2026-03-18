@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import logging
 import sys
 from typing import Callable, Dict, Optional
@@ -26,7 +27,6 @@ from pingpong.api_keys import (
     set_as_default_oai_api_key,
     transfer_api_keys,
 )
-from pingpong.errors import sentry
 from pingpong.merge import (
     get_merged_user_tuples,
     list_all_permissions,
@@ -70,6 +70,8 @@ from .auth import encode_auth_token
 from .bg import get_server
 from .canvas import canvas_sync_all
 from .config import config
+from .errors import sentry
+from . import lecture_video_processing
 from .models import (
     APIKey,
     Assistant,
@@ -113,6 +115,11 @@ def lti() -> None:
 
 @cli.group("export")
 def export() -> None:
+    pass
+
+
+@cli.group("lecture-video")
+def lecture_video() -> None:
     pass
 
 
@@ -1382,6 +1389,37 @@ FUNCTIONS_MAP: Dict[str, Callable] = {
 }
 
 
+@lecture_video.command("run-worker")
+@click.option("--host", default="localhost")
+@click.option("--port", default=8001)
+@click.option(
+    "--poll-interval",
+    default=lecture_video_processing.DEFAULT_WORKER_POLL_INTERVAL_SECONDS,
+    type=click.FloatRange(min=0, min_open=True),
+    show_default=True,
+)
+@click.option(
+    "--workers",
+    default=1,
+    type=click.IntRange(min=1),
+    show_default=True,
+)
+def run_lecture_video_worker(
+    host: str,
+    port: int,
+    poll_interval: float,
+    workers: int,
+) -> None:
+    server = get_server(host=host, port=port)
+
+    with sentry(), server.run_in_thread():
+        with contextlib.suppress(KeyboardInterrupt):
+            lecture_video_processing.run_narration_processing_worker_pool(
+                poll_interval_seconds=poll_interval,
+                workers=workers,
+            )
+
+
 @schedule.command("schedule_tasks")
 @click.option("--host", default="localhost")
 @click.option("--port", default=8001)
@@ -1447,7 +1485,7 @@ def run_dynamic_tasks_with_args(host: str, port: int, tasks: list[str]) -> None:
         await asyncio.gather(*task_coroutines)
 
     # Run the Uvicorn server in the background
-    with sentry(), server.run_in_thread():
+    with server.run_in_thread():
         asyncio.run(_parse_tasks())
 
 
