@@ -362,7 +362,7 @@
 
 	// Panopto state
 	$: panoptoStatus = data.panoptoStatus?.status || 'none';
-	$: panoptoTenants = [] as api.PanoptoTenant[];
+	let panoptoTenants: api.PanoptoTenant[] = [];
 	let panoptoFolderQuery = '';
 	let panoptoFolderResults: api.PanoptoFolder[] = [];
 	let searchingPanoptoFolders = false;
@@ -2795,7 +2795,7 @@
 								</div>
 								{#if panoptoFolderResults.length > 0}
 									<div class="mt-3 flex flex-col gap-1">
-										{#each panoptoFolderResults as folder}
+										{#each panoptoFolderResults as folder (folder.id)}
 											<button
 												class="flex items-center justify-between rounded-md border border-yellow-300 bg-white px-3 py-2 text-left text-sm hover:bg-yellow-100"
 												onclick={() => linkPanoptoFolder(folder.id, folder.name)}
