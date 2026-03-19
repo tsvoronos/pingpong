@@ -696,6 +696,7 @@ class Config(BaseSettings):
 
     reload: int = Field(0)
     public_url: str = Field("http://localhost:8000")
+    external_url: str | None = Field(None)
     development: bool = Field(False)
     artifact_store: ArtifactStoreSettings = LocalStoreSettings(
         save_target="local_exports/thread_exports"
@@ -728,6 +729,16 @@ class Config(BaseSettings):
         if not path:
             return self.public_url
         return f"{self.public_url.rstrip('/')}/{path.lstrip('/')}"
+
+    def external_api_url(self, path: str) -> str:
+        """Return an externally-reachable API URL.
+
+        Uses external_url if set (for local dev with tunnels), otherwise
+        falls back to public_url. Use this for URLs that external services
+        (like OpenAI) need to reach.
+        """
+        base = self.external_url or self.public_url
+        return f"{base.rstrip('/')}/{path.lstrip('/')}"
 
 
 def _load_config() -> Config:

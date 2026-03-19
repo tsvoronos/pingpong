@@ -932,7 +932,10 @@ async def auth_canvas(request: StateRequest):
 # --- Panopto Integration Endpoints ---
 
 
-@v1.get("/auth/panopto")
+@v1.get(
+    "/auth/panopto",
+    dependencies=[Depends(LoggedIn())],
+)
 async def auth_panopto_redirect(request: StateRequest):
     """Generate Panopto OAuth2 redirect URL."""
     from pingpong.panopto import get_panopto_auth_link
@@ -975,7 +978,18 @@ async def auth_panopto_callback(request: StateRequest):
             status_code=303,
         )
 
-    if not code or user_id != request.state["session"].user.id:
+    if not code:
+        return RedirectResponse(
+            config.url(f"/group/{class_id}/manage?panopto_error=1"),
+            status_code=303,
+        )
+
+    # Verify user identity if session is available. The callback may arrive on
+    # a different domain (e.g. ngrok tunnel) where the session cookie isn't sent.
+    # This is safe because the state JWT is signed, time-limited (10 min), and
+    # contains the user_id — so the user identity is already verified via the token.
+    session = request.state["session"]
+    if session and session.user and user_id != session.user.id:
         return RedirectResponse(
             config.url(f"/group/{class_id}/manage?panopto_error=1"),
             status_code=303,
@@ -1070,7 +1084,7 @@ async def link_panopto_folder(request: StateRequest, class_id: int):
         request.state["db"],
         {
             "display_name": f"Panopto: {folder_name}",
-            "server_url": config.url("/api/v1/mcp/panopto"),
+            "server_url": config.external_api_url("/api/v1/mcp/panopto"),
             "description": f"Search and retrieve transcripts from Panopto lecture recordings in {folder_name}.",
             "enabled": True,
             "is_internal": True,

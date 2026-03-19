@@ -36,8 +36,8 @@ def upgrade() -> None:
     # 2. Create mcp_server_tool_class_associations table
     op.create_table(
         "mcp_server_tool_class_associations",
-        sa.Column("mcp_server_tool_id", sa.Integer(), nullable=True),
-        sa.Column("class_id", sa.Integer(), nullable=True),
+        sa.Column("mcp_server_tool_id", sa.Integer(), nullable=False),
+        sa.Column("class_id", sa.Integer(), nullable=False),
         sa.ForeignKeyConstraint(
             ["class_id"],
             ["classes.id"],
@@ -81,12 +81,12 @@ def upgrade() -> None:
         )
 
     # 4. Drop the panopto_mcp_server_tool_id column from classes
-    op.drop_constraint(
-        "classes_panopto_mcp_server_tool_id_fkey",
-        "classes",
-        type_="foreignkey",
-    )
-    op.drop_column("classes", "panopto_mcp_server_tool_id")
+    with op.batch_alter_table("classes") as batch_op:
+        batch_op.drop_constraint(
+            "classes_panopto_mcp_server_tool_id_fkey",
+            type_="foreignkey",
+        )
+        batch_op.drop_column("panopto_mcp_server_tool_id")
 
 
 def downgrade() -> None:

@@ -3701,8 +3701,10 @@ mcp_server_tool_assistant_association = Table(
 mcp_server_tool_class_association = Table(
     "mcp_server_tool_class_associations",
     Base.metadata,
-    Column("mcp_server_tool_id", Integer, ForeignKey("mcp_server_tools.id")),
-    Column("class_id", Integer, ForeignKey("classes.id")),
+    Column(
+        "mcp_server_tool_id", Integer, ForeignKey("mcp_server_tools.id"), nullable=False
+    ),
+    Column("class_id", Integer, ForeignKey("classes.id"), nullable=False),
     Index(
         "mcp_server_tool_class_idx",
         "mcp_server_tool_id",
