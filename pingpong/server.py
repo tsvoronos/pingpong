@@ -1005,7 +1005,10 @@ async def auth_panopto_callback(request: StateRequest):
     )
 
 
-@v1.get("/class/{class_id}/panopto/tenants")
+@v1.get(
+    "/class/{class_id}/panopto/tenants",
+    dependencies=[Depends(Authz("can_edit_info", "class:{class_id}"))],
+)
 async def get_panopto_tenants_endpoint(request: StateRequest, class_id: int):
     """Get available Panopto tenants for this institution."""
     from pingpong.panopto import get_panopto_tenants
@@ -1013,7 +1016,10 @@ async def get_panopto_tenants_endpoint(request: StateRequest, class_id: int):
     return {"tenants": get_panopto_tenants()}
 
 
-@v1.get("/class/{class_id}/panopto/folders")
+@v1.get(
+    "/class/{class_id}/panopto/folders",
+    dependencies=[Depends(Authz("can_edit_info", "class:{class_id}"))],
+)
 async def search_panopto_folders_endpoint(request: StateRequest, class_id: int):
     """Search Panopto folders. Requires AUTHORIZED or LINKED status."""
     from pingpong.panopto import get_panopto_access_token, search_panopto_folders
@@ -1036,7 +1042,10 @@ async def search_panopto_folders_endpoint(request: StateRequest, class_id: int):
     }
 
 
-@v1.post("/class/{class_id}/panopto/link")
+@v1.post(
+    "/class/{class_id}/panopto/link",
+    dependencies=[Depends(Authz("can_edit_info", "class:{class_id}"))],
+)
 async def link_panopto_folder(request: StateRequest, class_id: int):
     """Link a Panopto folder to this class and auto-create MCP server tool."""
     from pingpong.panopto import get_panopto_access_token
@@ -1052,13 +1061,34 @@ async def link_panopto_folder(request: StateRequest, class_id: int):
 
     access_token, tenant = await get_panopto_access_token(request.state["db"], class_id)
 
+    # Clean up any existing MCP tool from a previous link
+    from sqlalchemy import delete, select, update as sql_update
+
+    existing_tool_stmt = select(models.Class.panopto_mcp_server_tool_id).where(
+        models.Class.id == class_id
+    )
+    existing_tool_result = await request.state["db"].execute(existing_tool_stmt)
+    existing_tool_id = existing_tool_result.scalar_one_or_none()
+    if existing_tool_id:
+        await request.state["db"].execute(
+            delete(models.mcp_server_tool_assistant_association).where(
+                models.mcp_server_tool_assistant_association.c.mcp_server_tool_id
+                == existing_tool_id
+            )
+        )
+        await request.state["db"].execute(
+            sql_update(models.MCPServerTool)
+            .where(models.MCPServerTool.id == existing_tool_id)
+            .values(enabled=False)
+        )
+
     # Create an MCPServerTool pointing to PingPong's own MCP endpoint
     from pingpong.auth import encode_auth_token
     import json
 
     mcp_auth_token = encode_auth_token(
         sub=json.dumps({"class_id": class_id, "type": "panopto_mcp"}),
-        expiry=60 * 60 * 24 * 365 * 10,  # 10 years — effectively permanent
+        expiry=60 * 60 * 24 * 365,  # 1 year
     )
 
     mcp_tool = await models.MCPServerTool.create(
@@ -1085,7 +1115,10 @@ async def link_panopto_folder(request: StateRequest, class_id: int):
     return {"status": "linked", "folder_id": folder_id, "folder_name": folder_name}
 
 
-@v1.get("/class/{class_id}/panopto/status")
+@v1.get(
+    "/class/{class_id}/panopto/status",
+    dependencies=[Depends(Authz("can_edit_info", "class:{class_id}"))],
+)
 async def get_panopto_status(request: StateRequest, class_id: int):
     """Get Panopto connection status for a class."""
     from sqlalchemy import select
@@ -1111,7 +1144,10 @@ async def get_panopto_status(request: StateRequest, class_id: int):
     }
 
 
-@v1.delete("/class/{class_id}/panopto")
+@v1.delete(
+    "/class/{class_id}/panopto",
+    dependencies=[Depends(Authz("can_edit_info", "class:{class_id}"))],
+)
 async def disconnect_panopto(request: StateRequest, class_id: int):
     """Disconnect Panopto from this class."""
     # Get the MCP tool ID to clean up
@@ -1256,6 +1292,17 @@ async def panopto_mcp_endpoint(request: StateRequest):
     elif method == "tools/call":
         if not class_id:
             return jsonrpc_error(-32600, "Unauthorized: invalid or missing token")
+
+        # Verify the class still has Panopto linked
+        from sqlalchemy import select as sa_select
+
+        status_stmt = sa_select(models.Class.panopto_status).where(
+            models.Class.id == class_id
+        )
+        status_result = await request.state["db"].execute(status_stmt)
+        panopto_status = status_result.scalar_one_or_none()
+        if panopto_status != schemas.PanoptoStatus.LINKED:
+            return jsonrpc_error(-32600, "Panopto is not linked to this class")
 
         tool_name = params.get("name")
         arguments = params.get("arguments", {})

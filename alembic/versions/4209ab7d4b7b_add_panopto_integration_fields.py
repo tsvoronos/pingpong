@@ -1,7 +1,7 @@
 """Add Panopto integration fields to classes
 
 Revision ID: 4209ab7d4b7b
-Revises: f9f8097f7ce1
+Revises: 4d7f7f5c1c12
 Create Date: 2026-03-18 13:00:00.000000
 
 """

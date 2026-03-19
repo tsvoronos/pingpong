@@ -5044,6 +5044,15 @@ class Class(Base):
         ).where(Class.id == class_id)
         response = await session.execute(stmt)
         result = response.first()
+        if not result:
+            return {
+                "user_id": None,
+                "access_token": None,
+                "refresh_token": None,
+                "expires_in": None,
+                "token_added_at": None,
+                "now": None,
+            }
         return {
             "user_id": result[0],
             "access_token": result[1],
