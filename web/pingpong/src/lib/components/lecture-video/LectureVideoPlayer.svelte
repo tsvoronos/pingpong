@@ -131,6 +131,7 @@
 	let previewVideoReady = $state(false);
 	let previewVideoFrameReady = $state(false);
 	let lastCapturedPreviewFrameTimeS: number | null = $state(null);
+	let snapshotCanvasHasFrame = $state(false);
 	let lastPreviewVideoSrc: string | undefined = undefined;
 	let lastMainVideoSrc: string | undefined = undefined;
 	let keyboardActionIndicator: KeyboardActionIndicator | null = $state(null);
@@ -575,6 +576,7 @@
 		previewVideoReady = false;
 		previewVideoFrameReady = false;
 		lastCapturedPreviewFrameTimeS = null;
+		snapshotCanvasHasFrame = false;
 	}
 
 	function schedulePreviewVideoDeactivate(delayMs: number = PREVIEW_VIDEO_IDLE_DEACTIVATE_MS) {
@@ -616,6 +618,7 @@
 		const ctx = snapshotCanvasElement.getContext('2d');
 		if (!ctx) return;
 		ctx.clearRect(0, 0, snapshotCanvasElement.width, snapshotCanvasElement.height);
+		snapshotCanvasHasFrame = false;
 	}
 
 	function captureSnapshotFromVideo(sourceVideo: HTMLVideoElement | null) {
@@ -638,6 +641,7 @@
 		}
 
 		ctx.drawImage(sourceVideo, 0, 0, sourceWidth, sourceHeight);
+		snapshotCanvasHasFrame = true;
 	}
 
 	function captureMainVideoSnapshot() {
@@ -646,7 +650,7 @@
 
 	function showSeekPreview(pointerOffsetPx: number, offsetMs: number) {
 		activatePreviewVideo();
-		if (!seekPreviewVisible) {
+		if (!seekPreviewVisible && !snapshotCanvasHasFrame) {
 			captureMainVideoSnapshot();
 		}
 		seekPreviewVisible = true;
