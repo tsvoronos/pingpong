@@ -4264,7 +4264,10 @@ export const getPanoptoTenants = async (f: Fetcher, classId: number) => {
 };
 
 export const searchPanoptoFolders = async (f: Fetcher, classId: number, query: string) => {
-	return await GET<never, PanoptoFolders>(f, `class/${classId}/panopto/folders?query=${encodeURIComponent(query)}`);
+	return await GET<never, PanoptoFolders>(
+		f,
+		`class/${classId}/panopto/folders?query=${encodeURIComponent(query)}`
+	);
 };
 
 export const linkPanoptoFolder = async (

@@ -95,7 +95,11 @@ async function loadClassMCPServers(
 	const response = await getClassMCPServers(fetchFn, classId).then(expandResponse);
 	if (response.error) return [];
 	// Pre-populate with enabled=false and no server_label (treated as new when saving)
-	return response.data.mcp_servers.map((s: MCPServerToolInput) => ({ ...s, enabled: false, server_label: undefined }));
+	return response.data.mcp_servers.map((s: MCPServerToolInput) => ({
+		...s,
+		enabled: false,
+		server_label: undefined
+	}));
 }
 
 async function loadAssistantLectureVideoConfig(
@@ -167,9 +171,7 @@ export const load: PageLoad = async ({ params, fetch, parent }) => {
 
 			// Merge in class-level MCP servers that aren't already on this assistant
 			for (const classServer of classMCPServers) {
-				const alreadyExists = mcpServers.some(
-					(s) => s.server_url === classServer.server_url
-				);
+				const alreadyExists = mcpServers.some((s) => s.server_url === classServer.server_url);
 				if (!alreadyExists) {
 					mcpServers.push(classServer);
 				}

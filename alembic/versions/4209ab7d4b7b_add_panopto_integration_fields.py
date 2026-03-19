@@ -23,21 +23,54 @@ def upgrade() -> None:
     _ = revision, down_revision, branch_labels, depends_on
 
     panopto_status_enum = sa.Enum(
-        "NONE", "AUTHORIZED", "LINKED", "ERROR", "DISMISSED",
+        "NONE",
+        "AUTHORIZED",
+        "LINKED",
+        "ERROR",
+        "DISMISSED",
         name="panoptostatus",
     )
     panopto_status_enum.create(op.get_bind(), checkfirst=True)
 
-    op.add_column("classes", sa.Column("panopto_status", panopto_status_enum, nullable=True, server_default="NONE"))
+    op.add_column(
+        "classes",
+        sa.Column(
+            "panopto_status", panopto_status_enum, nullable=True, server_default="NONE"
+        ),
+    )
     op.add_column("classes", sa.Column("panopto_tenant", sa.String(), nullable=True))
-    op.add_column("classes", sa.Column("panopto_user_id", sa.Integer(), sa.ForeignKey("users.id"), nullable=True))
+    op.add_column(
+        "classes",
+        sa.Column(
+            "panopto_user_id", sa.Integer(), sa.ForeignKey("users.id"), nullable=True
+        ),
+    )
     op.add_column("classes", sa.Column("panopto_folder_id", sa.String(), nullable=True))
-    op.add_column("classes", sa.Column("panopto_folder_name", sa.String(), nullable=True))
-    op.add_column("classes", sa.Column("panopto_access_token", sa.String(), nullable=True))
-    op.add_column("classes", sa.Column("panopto_refresh_token", sa.String(), nullable=True))
-    op.add_column("classes", sa.Column("panopto_expires_in", sa.Integer(), nullable=True))
-    op.add_column("classes", sa.Column("panopto_token_added_at", sa.DateTime(timezone=True), nullable=True))
-    op.add_column("classes", sa.Column("panopto_mcp_server_tool_id", sa.Integer(), sa.ForeignKey("mcp_server_tools.id"), nullable=True))
+    op.add_column(
+        "classes", sa.Column("panopto_folder_name", sa.String(), nullable=True)
+    )
+    op.add_column(
+        "classes", sa.Column("panopto_access_token", sa.String(), nullable=True)
+    )
+    op.add_column(
+        "classes", sa.Column("panopto_refresh_token", sa.String(), nullable=True)
+    )
+    op.add_column(
+        "classes", sa.Column("panopto_expires_in", sa.Integer(), nullable=True)
+    )
+    op.add_column(
+        "classes",
+        sa.Column("panopto_token_added_at", sa.DateTime(timezone=True), nullable=True),
+    )
+    op.add_column(
+        "classes",
+        sa.Column(
+            "panopto_mcp_server_tool_id",
+            sa.Integer(),
+            sa.ForeignKey("mcp_server_tools.id"),
+            nullable=True,
+        ),
+    )
 
 
 def downgrade() -> None:

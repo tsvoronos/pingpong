@@ -7,50 +7,64 @@ import type { PageLoad } from './$types';
  */
 export const load = async ({ fetch, params }: Parameters<PageLoad>[0]) => {
 	const classId = parseInt(params.classId, 10);
-	const [classDataResponse, grants, canvasInstances, ltiClasses, panoptoStatusResponse] = await Promise.all([
-		// Even though we `getClass` at the parent layout, we need to do it again here since we might have an updated lastRateLimitedAt value.
-		api.getClass(fetch, classId).then(api.expandResponse),
-		api.grants(fetch, {
-			canEditInfo: { target_type: 'class', target_id: classId, relation: 'can_edit_info' },
-			canPublishThreads: {
-				target_type: 'class',
-				target_id: classId,
-				relation: 'can_publish_threads'
-			},
-			canUploadClassFiles: {
-				target_type: 'class',
-				target_id: classId,
-				relation: 'can_upload_class_files'
-			},
-			isAdmin: {
-				target_type: 'class',
-				target_id: classId,
-				relation: 'admin'
-			},
-			isTeacher: {
-				target_type: 'class',
-				target_id: classId,
-				relation: 'teacher'
-			},
-			isStudent: {
-				target_type: 'class',
-				target_id: classId,
-				relation: 'student'
-			},
-			canViewApiKey: { target_type: 'class', target_id: classId, relation: 'can_view_api_key' },
-			canViewUsers: { target_type: 'class', target_id: classId, relation: 'can_view_users' },
-			canDelete: { target_type: 'class', target_id: classId, relation: 'can_delete' },
-			canManageUsers: { target_type: 'class', target_id: classId, relation: 'can_manage_users' },
-			canReceiveSummaries: {
-				target_type: 'class',
-				target_id: classId,
-				relation: 'can_receive_summaries'
-			}
-		}),
-		api.loadLMSInstances(fetch, classId, 'canvas').then(api.expandResponse),
-		api.loadLTIClasses(fetch, classId).then(api.expandResponse),
-		api.getPanoptoStatus(fetch, classId).then(api.expandResponse).catch(() => ({ data: { status: 'none', tenant: null, folder_id: null, folder_name: null, mcp_server_tool_id: null }, error: null, $status: 200 }))
-	]);
+	const [classDataResponse, grants, canvasInstances, ltiClasses, panoptoStatusResponse] =
+		await Promise.all([
+			// Even though we `getClass` at the parent layout, we need to do it again here since we might have an updated lastRateLimitedAt value.
+			api.getClass(fetch, classId).then(api.expandResponse),
+			api.grants(fetch, {
+				canEditInfo: { target_type: 'class', target_id: classId, relation: 'can_edit_info' },
+				canPublishThreads: {
+					target_type: 'class',
+					target_id: classId,
+					relation: 'can_publish_threads'
+				},
+				canUploadClassFiles: {
+					target_type: 'class',
+					target_id: classId,
+					relation: 'can_upload_class_files'
+				},
+				isAdmin: {
+					target_type: 'class',
+					target_id: classId,
+					relation: 'admin'
+				},
+				isTeacher: {
+					target_type: 'class',
+					target_id: classId,
+					relation: 'teacher'
+				},
+				isStudent: {
+					target_type: 'class',
+					target_id: classId,
+					relation: 'student'
+				},
+				canViewApiKey: { target_type: 'class', target_id: classId, relation: 'can_view_api_key' },
+				canViewUsers: { target_type: 'class', target_id: classId, relation: 'can_view_users' },
+				canDelete: { target_type: 'class', target_id: classId, relation: 'can_delete' },
+				canManageUsers: { target_type: 'class', target_id: classId, relation: 'can_manage_users' },
+				canReceiveSummaries: {
+					target_type: 'class',
+					target_id: classId,
+					relation: 'can_receive_summaries'
+				}
+			}),
+			api.loadLMSInstances(fetch, classId, 'canvas').then(api.expandResponse),
+			api.loadLTIClasses(fetch, classId).then(api.expandResponse),
+			api
+				.getPanoptoStatus(fetch, classId)
+				.then(api.expandResponse)
+				.catch(() => ({
+					data: {
+						status: 'none',
+						tenant: null,
+						folder_id: null,
+						folder_name: null,
+						mcp_server_tool_id: null
+					},
+					error: null,
+					$status: 200
+				}))
+		]);
 
 	if (classDataResponse.error) {
 		error(classDataResponse.$status, classDataResponse.error.detail || 'Unknown error');
@@ -109,6 +123,12 @@ export const load = async ({ fetch, params }: Parameters<PageLoad>[0]) => {
 		subscription: subscription,
 		canvasInstances: canvasInstances.data.instances,
 		ltiClasses: ltiClasses.data.classes,
-		panoptoStatus: panoptoStatusResponse.data ?? { status: 'none', tenant: null, folder_id: null, folder_name: null, mcp_server_tool_id: null }
+		panoptoStatus: panoptoStatusResponse.data ?? {
+			status: 'none',
+			tenant: null,
+			folder_id: null,
+			folder_name: null,
+			mcp_server_tool_id: null
+		}
 	};
 };

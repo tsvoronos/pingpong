@@ -935,7 +935,7 @@ async def auth_canvas(request: StateRequest):
 @v1.get("/auth/panopto")
 async def auth_panopto_redirect(request: StateRequest):
     """Generate Panopto OAuth2 redirect URL."""
-    from pingpong.panopto import get_panopto_auth_link, get_panopto_tenants
+    from pingpong.panopto import get_panopto_auth_link
 
     class_id = request.query_params.get("class_id")
     tenant = request.query_params.get("tenant")
@@ -967,9 +967,7 @@ async def auth_panopto_callback(request: StateRequest):
         class_id = int(state_data["class_id"])
         tenant = state_data["panopto_tenant"]
     except Exception:
-        return RedirectResponse(
-            config.url("/?error_code=1"), status_code=303
-        )
+        return RedirectResponse(config.url("/?error_code=1"), status_code=303)
 
     if error:
         return RedirectResponse(
@@ -1024,13 +1022,15 @@ async def search_panopto_folders_endpoint(request: StateRequest, class_id: int):
     if not query:
         raise HTTPException(status_code=400, detail="query parameter is required")
 
-    access_token, tenant = await get_panopto_access_token(
-        request.state["db"], class_id
-    )
+    access_token, tenant = await get_panopto_access_token(request.state["db"], class_id)
     folders = await search_panopto_folders(access_token, tenant, query)
     return {
         "folders": [
-            {"id": f.get("Id"), "name": f.get("Name"), "description": f.get("Description")}
+            {
+                "id": f.get("Id"),
+                "name": f.get("Name"),
+                "description": f.get("Description"),
+            }
             for f in folders
         ]
     }
@@ -1039,18 +1039,18 @@ async def search_panopto_folders_endpoint(request: StateRequest, class_id: int):
 @v1.post("/class/{class_id}/panopto/link")
 async def link_panopto_folder(request: StateRequest, class_id: int):
     """Link a Panopto folder to this class and auto-create MCP server tool."""
-    from pingpong.panopto import get_panopto_access_token, get_panopto_config
+    from pingpong.panopto import get_panopto_access_token
 
     body = await request.json()
     folder_id = body.get("folder_id")
     folder_name = body.get("folder_name")
 
     if not folder_id or not folder_name:
-        raise HTTPException(status_code=400, detail="folder_id and folder_name are required")
+        raise HTTPException(
+            status_code=400, detail="folder_id and folder_name are required"
+        )
 
-    access_token, tenant = await get_panopto_access_token(
-        request.state["db"], class_id
-    )
+    access_token, tenant = await get_panopto_access_token(request.state["db"], class_id)
 
     # Create an MCPServerTool pointing to PingPong's own MCP endpoint
     from pingpong.auth import encode_auth_token
@@ -1197,7 +1197,9 @@ async def panopto_mcp_endpoint(request: StateRequest):
 
     # Authenticate: extract class_id from the authorization token
     auth_header = request.headers.get("authorization", "")
-    bearer_token = auth_header.replace("Bearer ", "") if auth_header.startswith("Bearer ") else ""
+    bearer_token = (
+        auth_header.replace("Bearer ", "") if auth_header.startswith("Bearer ") else ""
+    )
 
     class_id = None
     if bearer_token:
@@ -1221,7 +1223,11 @@ async def panopto_mcp_endpoint(request: StateRequest):
         )
 
     def jsonrpc_error(code, message):
-        data = {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}}
+        data = {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": {"code": code, "message": message},
+        }
         content = f"event: message\ndata: {json_mod.dumps(data)}\n\n"
         return Response(
             content=content,
@@ -9540,7 +9546,10 @@ async def create_assistant(
                 mcp_input: schemas.MCPServerToolInput, assistant_id: int
             ) -> models.MCPServerTool:
                 # Reuse existing class-level MCP tool (e.g. Panopto) instead of creating a duplicate
-                if _class_mcp_tool and mcp_input.server_url_str == _class_mcp_tool.server_url:
+                if (
+                    _class_mcp_tool
+                    and mcp_input.server_url_str == _class_mcp_tool.server_url
+                ):
                     return _class_mcp_tool
 
                 headers_json = None
@@ -10545,7 +10554,9 @@ async def update_assistant(
                 )
             )
         ).scalar_one_or_none()
-    _class_mcp_tool_url_upd = _class_mcp_tool_upd.server_url if _class_mcp_tool_upd else None
+    _class_mcp_tool_url_upd = (
+        _class_mcp_tool_upd.server_url if _class_mcp_tool_upd else None
+    )
 
     existing_mcp_by_label = {}
     if "mcp_servers" in req.model_fields_set and req.mcp_servers:
@@ -10554,7 +10565,10 @@ async def update_assistant(
         for mcp_input in req.mcp_servers:
             if not mcp_input.server_label:
                 # Skip validation for class-level MCP tools (e.g. Panopto)
-                if _class_mcp_tool_url_upd and mcp_input.server_url_str == _class_mcp_tool_url_upd:
+                if (
+                    _class_mcp_tool_url_upd
+                    and mcp_input.server_url_str == _class_mcp_tool_url_upd
+                ):
                     continue
                 if (
                     mcp_input.auth_type == schemas.MCPAuthType.TOKEN
@@ -10759,7 +10773,10 @@ async def update_assistant(
 
         async def upsert_mcp_server(mcp_input: schemas.MCPServerToolInput) -> int:
             # Reuse existing class-level MCP tool (e.g. Panopto) instead of creating a duplicate
-            if _class_mcp_tool_upd and mcp_input.server_url_str == _class_mcp_tool_url_upd:
+            if (
+                _class_mcp_tool_upd
+                and mcp_input.server_url_str == _class_mcp_tool_url_upd
+            ):
                 return _class_mcp_tool_upd.id
 
             headers_json = None

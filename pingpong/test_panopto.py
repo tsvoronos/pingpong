@@ -1,9 +1,8 @@
 """Tests for Panopto integration."""
 
-import json
 import pytest
-from unittest.mock import AsyncMock, patch, MagicMock
-from datetime import datetime, timedelta
+from unittest.mock import AsyncMock, patch
+from datetime import datetime
 
 import pytz
 
@@ -97,7 +96,10 @@ def test_encode_decode_panopto_state():
         )
     )
     try:
-        now = lambda: datetime(2024, 6, 1, 0, 0, 0, tzinfo=pytz.utc)
+
+        def now():
+            return datetime(2024, 6, 1, 0, 0, 0, tzinfo=pytz.utc)
+
         state = encode_panopto_state(1, 42, "test", nowfn=now)
         decoded = decode_panopto_state(state, nowfn=now)
         assert decoded["class_id"] == 1
@@ -153,7 +155,9 @@ def test_format_panopto_session_no_captions():
 async def test_handle_mcp_search_no_results():
     from pingpong.panopto import handle_mcp_tool_call
 
-    with patch("pingpong.panopto.search_panopto_sessions", new_callable=AsyncMock) as mock:
+    with patch(
+        "pingpong.panopto.search_panopto_sessions", new_callable=AsyncMock
+    ) as mock:
         mock.return_value = []
         result = await handle_mcp_tool_call(
             "search_recordings",
@@ -179,7 +183,9 @@ async def test_handle_mcp_search_with_results():
             "Description": None,
         }
     ]
-    with patch("pingpong.panopto.search_panopto_sessions", new_callable=AsyncMock) as mock:
+    with patch(
+        "pingpong.panopto.search_panopto_sessions", new_callable=AsyncMock
+    ) as mock:
         mock.return_value = mock_sessions
         result = await handle_mcp_tool_call(
             "search_recordings",
@@ -195,9 +201,7 @@ async def test_handle_mcp_search_with_results():
 async def test_handle_mcp_unknown_tool():
     from pingpong.panopto import handle_mcp_tool_call
 
-    result = await handle_mcp_tool_call(
-        "nonexistent_tool", {}, "token", "tenant"
-    )
+    result = await handle_mcp_tool_call("nonexistent_tool", {}, "token", "tenant")
     assert "Unknown tool" in result
 
 

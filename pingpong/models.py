@@ -4607,7 +4607,9 @@ class Class(Base):
     lms_class = relationship("LMSClass", back_populates="classes")
     lti_classes = relationship("LTIClass", back_populates="class_")
     lms_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
-    lms_user = relationship("User", back_populates="lms_syncs", foreign_keys="[Class.lms_user_id]")
+    lms_user = relationship(
+        "User", back_populates="lms_syncs", foreign_keys="[Class.lms_user_id]"
+    )
     lms_course_id = Column(Integer, nullable=True)
     lms_access_token = Column(String, nullable=True)
     lms_refresh_token = Column(String, nullable=True)
@@ -5030,9 +5032,7 @@ class Class(Base):
         await session.execute(stmt)
 
     @classmethod
-    async def get_panopto_token(
-        cls, session: AsyncSession, class_id: int
-    ) -> dict:
+    async def get_panopto_token(cls, session: AsyncSession, class_id: int) -> dict:
         """Return Panopto token info with DB time."""
         stmt = select(
             Class.panopto_user_id,
@@ -5054,9 +5054,7 @@ class Class(Base):
         }
 
     @classmethod
-    async def mark_panopto_error(
-        cls, session: AsyncSession, class_id: int
-    ) -> None:
+    async def mark_panopto_error(cls, session: AsyncSession, class_id: int) -> None:
         """Mark Panopto connection as errored."""
         stmt = (
             update(Class)
@@ -5088,9 +5086,7 @@ class Class(Base):
         await session.execute(stmt)
 
     @classmethod
-    async def disconnect_panopto(
-        cls, session: AsyncSession, class_id: int
-    ) -> None:
+    async def disconnect_panopto(cls, session: AsyncSession, class_id: int) -> None:
         """Remove Panopto connection from this class."""
         stmt = (
             update(Class)

@@ -15,7 +15,6 @@ from pingpong.auth import decode_auth_token, encode_auth_token
 from pingpong.config import PanoptoSettings, config
 from pingpong.models import Class
 from pingpong.now import NowFn, utcnow
-from pingpong.schemas import PanoptoStatus
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +37,9 @@ def get_panopto_config(tenant: str) -> PanoptoSettings:
     for instance in config.panopto.instances:
         if instance.tenant == tenant:
             return instance
-    raise PanoptoException(f"No Panopto configuration found for tenant '{tenant}'", code=404)
+    raise PanoptoException(
+        f"No Panopto configuration found for tenant '{tenant}'", code=404
+    )
 
 
 def get_panopto_tenants() -> list[dict]:
@@ -83,9 +84,7 @@ def get_panopto_auth_link(class_id: int, user_id: int, tenant: str) -> str:
 # --- Token Management ---
 
 
-async def exchange_panopto_code(
-    code: str, tenant: str
-) -> dict:
+async def exchange_panopto_code(code: str, tenant: str) -> dict:
     """Exchange OAuth2 authorization code for tokens."""
     panopto_config = get_panopto_config(tenant)
     redirect_uri = config.url("/api/v1/auth/panopto/callback")
@@ -114,9 +113,7 @@ async def exchange_panopto_code(
             }
 
 
-async def refresh_panopto_token(
-    refresh_token: str, tenant: str
-) -> dict:
+async def refresh_panopto_token(refresh_token: str, tenant: str) -> dict:
     """Refresh Panopto access token."""
     panopto_config = get_panopto_config(tenant)
 
@@ -255,9 +252,7 @@ async def search_panopto_sessions(
     return result.get("Results", [])
 
 
-async def get_panopto_session(
-    access_token: str, tenant: str, session_id: str
-) -> dict:
+async def get_panopto_session(access_token: str, tenant: str, session_id: str) -> dict:
     """Get a Panopto session by ID."""
     return await _panopto_api_get(access_token, tenant, f"/sessions/{session_id}")
 
@@ -370,7 +365,11 @@ def parse_srt(srt_content: str) -> list[CaptionSegment]:
         text = re.sub(r"<[^>]+>", "", text)
 
         if text:
-            segments.append(CaptionSegment(index=index, start_seconds=start, end_seconds=end, text=text))
+            segments.append(
+                CaptionSegment(
+                    index=index, start_seconds=start, end_seconds=end, text=text
+                )
+            )
 
     return segments
 
@@ -421,7 +420,9 @@ def format_panopto_session(s: dict) -> dict:
         "duration_seconds": s.get("Duration"),
         "folder": folder_details.get("Name") or s.get("FolderName") or s.get("Folder"),
         "folder_id": folder_details.get("Id") or s.get("FolderId") or s.get("Folder"),
-        "has_captions": bool(urls.get("CaptionDownloadUrl") or s.get("CaptionDownloadUrl")),
+        "has_captions": bool(
+            urls.get("CaptionDownloadUrl") or s.get("CaptionDownloadUrl")
+        ),
         "viewer_url": urls.get("ViewerUrl") or s.get("ViewerUrl"),
     }
 
@@ -457,7 +458,9 @@ async def handle_mcp_tool_call(
             if r["description"]:
                 item += f"\n  Description: {r['description'][:200]}"
             items.append(item)
-        return f"Found {len(items)} recording(s) matching '{query}':\n\n" + "\n".join(items)
+        return f"Found {len(items)} recording(s) matching '{query}':\n\n" + "\n".join(
+            items
+        )
 
     elif tool_name == "get_transcript":
         recording_id = arguments["recording_id"]
@@ -465,7 +468,9 @@ async def handle_mcp_tool_call(
         title = session_data.get("Name", "Unknown")
         date = session_data.get("StartTime", "")
 
-        srt_content = await download_panopto_captions(access_token, tenant, recording_id)
+        srt_content = await download_panopto_captions(
+            access_token, tenant, recording_id
+        )
         if not srt_content:
             return f"No captions/transcript available for recording '{title}'."
 
@@ -486,7 +491,9 @@ async def handle_mcp_tool_call(
         if not folder_id:
             return "No folder_id provided and no folder linked to this class."
         page = int(arguments.get("page", 0))
-        sessions = await list_panopto_folder_sessions(access_token, tenant, folder_id, page)
+        sessions = await list_panopto_folder_sessions(
+            access_token, tenant, folder_id, page
+        )
         if not sessions:
             return f"No recordings found in folder (page {page})."
 
@@ -499,7 +506,10 @@ async def handle_mcp_tool_call(
                 f"Captions: {'Yes' if r['has_captions'] else 'No'}"
             )
             items.append(item)
-        return f"Recordings in folder (page {page}, showing {len(items)}):\n\n" + "\n".join(items)
+        return (
+            f"Recordings in folder (page {page}, showing {len(items)}):\n\n"
+            + "\n".join(items)
+        )
 
     elif tool_name == "list_folders":
         query = arguments.get("query", "")

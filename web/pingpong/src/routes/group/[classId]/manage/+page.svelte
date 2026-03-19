@@ -2746,8 +2746,8 @@
 							<div class="-mt-4 mb-4 flex flex-col gap-2 text-sm text-purple-900">
 								<p>
 									Connect your Panopto account to give assistants in this group access to lecture
-									recordings and transcripts. Students can ask questions about lecture content
-									and get answers with references to specific recordings.
+									recordings and transcripts. Students can ask questions about lecture content and
+									get answers with references to specific recordings.
 								</p>
 							</div>
 							<div class="flex grow-0 gap-1">
@@ -2778,7 +2778,9 @@
 										placeholder="Search folders (e.g., API 201)"
 										bind:value={panoptoFolderQuery}
 										class="max-w-xs"
-										on:keydown={(e) => { if (e.key === 'Enter') searchPanoptoFolders(); }}
+										on:keydown={(e) => {
+											if (e.key === 'Enter') searchPanoptoFolders();
+										}}
 									/>
 									<Button
 										pill
@@ -2822,8 +2824,9 @@
 							</div>
 							<div class="-mt-4 mb-4 text-sm text-green-800">
 								<p>
-									This group is linked to <span class="font-semibold">{data.panoptoStatus?.folder_name}</span> on Panopto.
-									Assistants with MCP tools enabled can search recordings and retrieve transcripts.
+									This group is linked to <span class="font-semibold"
+										>{data.panoptoStatus?.folder_name}</span
+									> on Panopto. Assistants with MCP tools enabled can search recordings and retrieve transcripts.
 								</p>
 							</div>
 							<div class="flex flex-row items-center justify-between">
