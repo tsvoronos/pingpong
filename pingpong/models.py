@@ -2652,6 +2652,9 @@ class LectureVideoThreadState(Base):
     last_known_offset_ms: Mapped[int] = mapped_column(
         Integer, nullable=False, server_default="0"
     )
+    furthest_offset_ms: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0"
+    )
     version: Mapped[int] = mapped_column(Integer, nullable=False, server_default="1")
     controller_session_id: Mapped[str | None] = mapped_column(String, nullable=True)
     controller_user_id: Mapped[int | None] = mapped_column(
@@ -2707,7 +2710,7 @@ class LectureVideoThreadState(Base):
             select(LectureVideoThreadState)
             .where(LectureVideoThreadState.thread_id == thread_id)
             .options(
-                joinedload(LectureVideoThreadState.thread).options(
+                selectinload(LectureVideoThreadState.thread).options(
                     *_thread_lecture_video_base_loaders()
                 ),
                 selectinload(LectureVideoThreadState.current_question).options(
@@ -2829,7 +2832,37 @@ class LectureVideoInteraction(Base):
             select(LectureVideoInteraction)
             .where(LectureVideoInteraction.thread_id == thread_id)
             .options(
-                selectinload(LectureVideoInteraction.question),
+                selectinload(LectureVideoInteraction.question).options(
+                    selectinload(LectureVideoQuestion.options),
+                    selectinload(LectureVideoQuestion.correct_option),
+                ),
+                selectinload(LectureVideoInteraction.option),
+                selectinload(LectureVideoInteraction.actor),
+            )
+            .order_by(asc(LectureVideoInteraction.event_index))
+        )
+        return list((await session.scalars(stmt)).all())
+
+    @classmethod
+    async def list_question_history_by_thread_id(
+        cls, session: AsyncSession, thread_id: int
+    ) -> list["LectureVideoInteraction"]:
+        stmt = (
+            select(LectureVideoInteraction)
+            .where(
+                LectureVideoInteraction.thread_id == thread_id,
+                LectureVideoInteraction.event_type.in_(
+                    [
+                        schemas.LectureVideoInteractionEventType.QUESTION_PRESENTED,
+                        schemas.LectureVideoInteractionEventType.ANSWER_SUBMITTED,
+                    ]
+                ),
+            )
+            .options(
+                selectinload(LectureVideoInteraction.question).options(
+                    selectinload(LectureVideoQuestion.options),
+                    selectinload(LectureVideoQuestion.correct_option),
+                ),
                 selectinload(LectureVideoInteraction.option),
                 selectinload(LectureVideoInteraction.actor),
             )

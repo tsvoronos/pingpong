@@ -4657,9 +4657,23 @@ async def get_lecture_video_history(
     if thread.interaction_mode != schemas.InteractionMode.LECTURE_VIDEO:
         raise HTTPException(status_code=404, detail="Lecture video thread not found.")
 
-    interactions = await models.LectureVideoInteraction.list_by_thread_id(
-        request.state["db"], thread.id
+    interactions = (
+        await models.LectureVideoInteraction.list_question_history_by_thread_id(
+            request.state["db"], thread.id
+        )
     )
+    reveal_all_correct_options = (
+        thread.lecture_video_state is not None
+        and thread.lecture_video_state.state
+        == schemas.LectureVideoSessionState.COMPLETED
+    )
+    answered_question_ids = {
+        interaction.question_id
+        for interaction in interactions
+        if interaction.event_type
+        == schemas.LectureVideoInteractionEventType.ANSWER_SUBMITTED
+        and interaction.question_id is not None
+    }
     user_id = request.state["session"].user.id
     current_user_ids = [user_id] + await models.User.get_previous_ids_by_id(
         request.state["db"], user_id
@@ -4687,6 +4701,34 @@ async def get_lecture_video_history(
                 question_text=interaction.question.question_text
                 if interaction.question
                 else None,
+                question_options=(
+                    [
+                        schemas.LectureVideoOptionPrompt(
+                            id=option.id,
+                            option_text=option.option_text,
+                            post_answer_text=(
+                                option.post_answer_text or None
+                                if option.id == interaction.option_id
+                                else None
+                            ),
+                        )
+                        for option in sorted(
+                            interaction.question.options, key=lambda item: item.position
+                        )
+                    ]
+                    if (interaction.question)
+                    else None
+                ),
+                correct_option_id=(
+                    interaction.question.correct_option.id
+                    if interaction.question
+                    and interaction.question.correct_option
+                    and (
+                        reveal_all_correct_options
+                        or interaction.question_id in answered_question_ids
+                    )
+                    else None
+                ),
                 option_id=interaction.option_id,
                 option_text=interaction.option.option_text
                 if interaction.option
