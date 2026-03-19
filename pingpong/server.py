@@ -1125,10 +1125,17 @@ async def disconnect_panopto(request: StateRequest, class_id: int):
 
     await models.Class.disconnect_panopto(request.state["db"], class_id)
 
-    # Disable the MCP server tool (don't delete — may be referenced by past runs)
+    # Remove the MCP tool from all assistants and disable it
+    # (don't delete the tool itself — may be referenced by past runs)
     if mcp_tool_id:
-        from sqlalchemy import update
+        from sqlalchemy import delete, update
 
+        await request.state["db"].execute(
+            delete(models.mcp_server_tool_assistant_association).where(
+                models.mcp_server_tool_assistant_association.c.mcp_server_tool_id
+                == mcp_tool_id
+            )
+        )
         await request.state["db"].execute(
             update(models.MCPServerTool)
             .where(models.MCPServerTool.id == mcp_tool_id)
