@@ -201,3 +201,4 @@ saml/**/*.crt
 
 # CodeQL
 .codeql/
+config_panopto.local.toml

@@ -75,6 +75,7 @@
 	import { onDestroy } from 'svelte';
 	import WebSourceChip from '$lib/components/WebSourceChip.svelte';
 	import MCPServerModal from '$lib/components/MCPServerModal.svelte';
+	import AssistantTemplateSelector from '$lib/components/AssistantTemplateSelector.svelte';
 	import { SvelteSet } from 'svelte/reactivity';
 	export let data;
 	const LECTURE_VIDEO_DEFAULT_INSTRUCTIONS = 'You are a lecture video assistant.';
@@ -2523,14 +2524,24 @@
 							>This is the prompt the language model will use to generate responses.</Helper
 						>
 					</div>
-					<Button
-						class="mb-1 flex max-h-fit max-w-fit shrink-0 flex-row items-center gap-x-2 rounded-lg border border-gray-400 bg-gradient-to-b from-gray-100 to-gray-200 px-2 py-0.5 text-xs text-gray-800 normal-case"
-						onclick={previewInstructions}
-						type="button"
-						disabled={$loading || uploadingFSPrivate || uploadingCIPrivate}
-					>
-						Preview
-					</Button>
+					<div class="mb-1 flex items-center gap-2">
+						<AssistantTemplateSelector
+							disabled={preventEdits || $loading}
+							className={data.class.name}
+							institutionName={data.class.institution?.name ?? ''}
+							on:apply={(e) => {
+								instructions = e.detail.instructions;
+							}}
+						/>
+						<Button
+							class="flex max-h-fit max-w-fit shrink-0 flex-row items-center gap-x-2 rounded-lg border border-gray-400 bg-gradient-to-b from-gray-100 to-gray-200 px-2 py-0.5 text-xs text-gray-800 normal-case"
+							onclick={previewInstructions}
+							type="button"
+							disabled={$loading || uploadingFSPrivate || uploadingCIPrivate}
+						>
+							Preview
+						</Button>
+					</div>
 				</div>
 				<Textarea
 					id="instructions"
