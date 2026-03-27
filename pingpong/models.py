@@ -72,6 +72,11 @@ from pingpong.log_utils import sanitize_for_log
 
 logger = logging.getLogger(__name__)
 
+_BILLING_DEFAULT_API_KEY_PROVIDERS = [
+    schemas.AIProvider.OPENAI.value,
+    schemas.AIProvider.AZURE.value,
+]
+
 
 def generate_lecture_video_interaction_idempotency_key() -> str:
     return f"server-{uuid.uuid7()}"
@@ -1781,7 +1786,19 @@ class Institution(Base):
     description = Column(String, nullable=True)
     logo = Column(String, nullable=True)
     default_api_key_id = Column(Integer, ForeignKey("api_keys.id"), nullable=True)
-    default_api_key_obj = relationship("APIKey")
+    default_api_key_obj = relationship("APIKey", foreign_keys=[default_api_key_id])
+    default_lv_narration_tts_api_key_id = Column(
+        Integer, ForeignKey("api_keys.id"), nullable=True
+    )
+    default_lv_narration_tts_api_key_obj = relationship(
+        "APIKey", foreign_keys=[default_lv_narration_tts_api_key_id]
+    )
+    default_lv_manifest_generation_api_key_id = Column(
+        Integer, ForeignKey("api_keys.id"), nullable=True
+    )
+    default_lv_manifest_generation_api_key_obj = relationship(
+        "APIKey", foreign_keys=[default_lv_manifest_generation_api_key_id]
+    )
     classes = relationship("Class", back_populates="institution")
     users: Mapped[List["UserInstitutionRole"]] = relationship(
         "UserInstitutionRole", back_populates="institution"
@@ -1819,9 +1836,12 @@ class Institution(Base):
         stmt = (
             select(func.count())
             .select_from(Institution)
+            .join(APIKey, Institution.default_api_key_id == APIKey.id)
             .where(
                 Institution.id.in_(ids),
                 Institution.default_api_key_id.is_not(None),
+                APIKey.available_as_default.is_(True),
+                APIKey.provider.in_(_BILLING_DEFAULT_API_KEY_PROVIDERS),
             )
         )
         count = await session.scalar(stmt)
@@ -1844,7 +1864,10 @@ class Institution(Base):
     ) -> List["Institution"]:
         stmt = (
             select(Institution)
+            .join(APIKey, Institution.default_api_key_id == APIKey.id)
             .where(Institution.default_api_key_id.is_not(None))
+            .where(APIKey.available_as_default.is_(True))
+            .where(APIKey.provider.in_(_BILLING_DEFAULT_API_KEY_PROVIDERS))
             .order_by(Institution.name.asc())
         )
         result = await session.execute(stmt)

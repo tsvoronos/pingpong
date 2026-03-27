@@ -17,6 +17,7 @@
 	import { ArrowRightOutline, PlusOutline, TrashBinOutline } from 'flowbite-svelte-icons';
 	import PageHeader from '$lib/components/PageHeader.svelte';
 	import * as api from '$lib/api';
+	import { buildInstitutionDefaultApiKeyUpdate } from '$lib/institutionDefaultApiKeys';
 	import { happyToast, sadToast } from '$lib/toast';
 	import { loading } from '$lib/stores/general';
 	import { resolve } from '$app/paths';
@@ -34,6 +35,12 @@
 	let selectedDefaultKeyId = institution.default_api_key_id
 		? `${institution.default_api_key_id}`
 		: '';
+	let selectedDefaultNarrationKeyId = institution.default_lv_narration_tts_api_key_id
+		? `${institution.default_lv_narration_tts_api_key_id}`
+		: '';
+	let selectedDefaultManifestKeyId = institution.default_lv_manifest_generation_api_key_id
+		? `${institution.default_lv_manifest_generation_api_key_id}`
+		: '';
 
 	$: isNewHeaderLayout = data.forceCollapsedLayout && data.forceShowSidebarButton;
 
@@ -49,9 +56,10 @@
 		});
 	}
 
-	$: defaultKeyOptions = [
+	const makeDefaultKeyOptions = (keys: api.DefaultAPIKey[], providers: string[]) => [
 		{ value: '', name: 'None' },
-		...defaultKeys
+		...keys
+			.filter((key) => providers.includes(key.provider))
 			.slice()
 			.sort((a, b) =>
 				(a.name || '').localeCompare(b.name || '', undefined, { sensitivity: 'base' })
@@ -61,6 +69,10 @@
 				name: `${key.name || key.provider} (${key.redacted_key})`
 			}))
 	];
+
+	$: defaultBillingKeyOptions = makeDefaultKeyOptions(defaultKeys, ['openai', 'azure']);
+	$: defaultNarrationKeyOptions = makeDefaultKeyOptions(defaultKeys, ['elevenlabs']);
+	$: defaultManifestKeyOptions = makeDefaultKeyOptions(defaultKeys, ['gemini']);
 
 	const sortAdmins = (admins: api.InstitutionAdmin[]) =>
 		[...admins].sort((a, b) =>
@@ -95,6 +107,12 @@
 		draftName = institution.name;
 		selectedDefaultKeyId = institution.default_api_key_id
 			? `${institution.default_api_key_id}`
+			: '';
+		selectedDefaultNarrationKeyId = institution.default_lv_narration_tts_api_key_id
+			? `${institution.default_lv_narration_tts_api_key_id}`
+			: '';
+		selectedDefaultManifestKeyId = institution.default_lv_manifest_generation_api_key_id
+			? `${institution.default_lv_manifest_generation_api_key_id}`
 			: '';
 		newAdminEmail = '';
 		managingAdmins = {};
@@ -170,22 +188,28 @@
 
 	const saveDefaultApiKey = async () => {
 		if ($loading || savingDefaultKey) return;
+		const payload = buildInstitutionDefaultApiKeyUpdate(
+			institution,
+			selectedDefaultKeyId,
+			selectedDefaultNarrationKeyId,
+			selectedDefaultManifestKeyId
+		);
+		if (Object.keys(payload).length === 0) return;
 		savingDefaultKey = true;
 		try {
-			const keyId = selectedDefaultKeyId ? Number(selectedDefaultKeyId) : null;
 			const response = api.expandResponse(
-				await api.setInstitutionDefaultApiKey(fetch, institution.id, { default_api_key_id: keyId })
+				await api.setInstitutionDefaultApiKey(fetch, institution.id, payload)
 			);
 			if (response.error) {
-				sadToast(response.error.detail || 'Could not update default API key');
+				sadToast(response.error.detail || 'Could not update default API keys');
 				return;
 			}
-			happyToast('Default API key updated');
+			happyToast('Default API keys updated');
 			await refresh();
 			await invalidateAll();
 		} catch (err) {
 			console.error(err);
-			sadToast('Could not update default API key');
+			sadToast('Could not update default API keys');
 		} finally {
 			savingDefaultKey = false;
 		}
@@ -232,17 +256,50 @@
 				onchange={saveName}
 			/>
 		</div>
-		<div>
-			<Label for="default-api-key" class="mb-1">Default API Key</Label>
-			<Helper class="mb-2">Optional: used for future defaults. Not currently used.</Helper>
-			<Select
-				id="default-api-key"
-				name="default-api-key"
-				items={defaultKeyOptions}
-				bind:value={selectedDefaultKeyId}
-				disabled={$loading || savingDefaultKey}
-				onchange={saveDefaultApiKey}
-			/>
+		<div class="space-y-4">
+			<Heading tag="h4" class="text-dark-blue-40 font-serif text-xl font-medium">
+				Default Credentials
+			</Heading>
+			<div>
+				<Label for="default-api-key" class="mb-1">Default Group Billing</Label>
+				<Helper class="mb-2">Only OpenAI and Azure keys can be used here.</Helper>
+				<Select
+					id="default-api-key"
+					name="default-api-key"
+					items={defaultBillingKeyOptions}
+					bind:value={selectedDefaultKeyId}
+					disabled={$loading || savingDefaultKey}
+					onchange={saveDefaultApiKey}
+				/>
+			</div>
+			<div>
+				<Label for="default-lv-narration-api-key" class="mb-1"
+					>Default Lecture Video Narration</Label
+				>
+				<Helper class="mb-2">Only ElevenLabs keys marked available as default can be used.</Helper>
+				<Select
+					id="default-lv-narration-api-key"
+					name="default-lv-narration-api-key"
+					items={defaultNarrationKeyOptions}
+					bind:value={selectedDefaultNarrationKeyId}
+					disabled={$loading || savingDefaultKey}
+					onchange={saveDefaultApiKey}
+				/>
+			</div>
+			<div>
+				<Label for="default-lv-manifest-api-key" class="mb-1"
+					>Default Lecture Video Manifest Generation</Label
+				>
+				<Helper class="mb-2">Only Gemini keys marked available as default can be used.</Helper>
+				<Select
+					id="default-lv-manifest-api-key"
+					name="default-lv-manifest-api-key"
+					items={defaultManifestKeyOptions}
+					bind:value={selectedDefaultManifestKeyId}
+					disabled={$loading || savingDefaultKey}
+					onchange={saveDefaultApiKey}
+				/>
+			</div>
 		</div>
 		<div class="space-y-4">
 			<Heading tag="h4" class="text-dark-blue-40 font-serif text-xl font-medium">
