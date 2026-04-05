@@ -45,6 +45,11 @@ export const load = async ({ fetch, params }: Parameters<PageLoad>[0]) => {
 				target_type: 'class',
 				target_id: classId,
 				relation: 'can_receive_summaries'
+			},
+			isRootAdmin: {
+				target_type: 'root',
+				target_id: 0,
+				relation: 'admin'
 			}
 		}),
 		api.loadLMSInstances(fetch, classId, 'canvas').then(api.expandResponse),
@@ -67,6 +72,7 @@ export const load = async ({ fetch, params }: Parameters<PageLoad>[0]) => {
 	let aiProvider: string | null | undefined = null;
 	let hasGeminiCredential: boolean | undefined = false;
 	let hasElevenlabsCredential: boolean | undefined = false;
+	let defaultKeys: api.DefaultAPIKey[] | undefined;
 	if (grants.canViewApiKey || grants.canEditInfo) {
 		const apiKeyResponse = await api.getApiKey(fetch, classId).then(api.expandResponse);
 		if (apiKeyResponse.error) {
@@ -81,6 +87,29 @@ export const load = async ({ fetch, params }: Parameters<PageLoad>[0]) => {
 			aiProvider = apiKeyResponse.data.ai_provider ?? null;
 			hasGeminiCredential = apiKeyResponse.data.has_gemini_credential ?? false;
 			hasElevenlabsCredential = apiKeyResponse.data.has_elevenlabs_credential ?? false;
+		}
+	}
+	let canReadDefaultApiKeys = false;
+	if (grants.canViewApiKey) {
+		if (grants.isRootAdmin) {
+			canReadDefaultApiKeys = true;
+		} else {
+			const institutionAdminResponse = classDataResponse.data.institution_id
+				? await api.grants(fetch, {
+						isInstitutionAdmin: {
+							target_type: 'institution',
+							target_id: classDataResponse.data.institution_id,
+							relation: 'admin'
+						}
+					})
+				: { isInstitutionAdmin: false };
+			canReadDefaultApiKeys = institutionAdminResponse.isInstitutionAdmin;
+		}
+	}
+	if (canReadDefaultApiKeys) {
+		const defaultKeysResponse = await api.getDefaultAPIKeys(fetch).then(api.expandResponse);
+		if (!defaultKeysResponse.error) {
+			defaultKeys = defaultKeysResponse.data.default_keys;
 		}
 	}
 
@@ -103,6 +132,7 @@ export const load = async ({ fetch, params }: Parameters<PageLoad>[0]) => {
 		aiProvider,
 		hasGeminiCredential,
 		hasElevenlabsCredential,
+		defaultKeys,
 		grants,
 		class: classDataResponse.data,
 		subscription: subscription,

@@ -1969,9 +1969,23 @@ class APIKeyCheck(BaseModel):
     has_lecture_video_providers: bool = False
 
 
+TKeySourceModel = TypeVar("TKeySourceModel", bound=BaseModel)
+
+
+def _validate_key_source(model: TKeySourceModel) -> TKeySourceModel:
+    if model.api_key_id is not None:
+        return model
+    if not model.api_key:
+        raise ValueError("api_key or api_key_id must be provided")
+    if model.provider is None:
+        raise ValueError("provider must be provided when api_key is used")
+    return model
+
+
 class UpdateApiKey(BaseModel):
-    api_key: str
-    provider: AIProvider
+    api_key: str | None = None
+    api_key_id: int | None = Field(None, gt=0)
+    provider: AIProvider | None = None
     endpoint: str | None = None
     api_version: str | None = None
 
@@ -1982,23 +1996,34 @@ class UpdateApiKey(BaseModel):
             return v.strip()
         return v
 
+    @model_validator(mode="after")
+    def validate_key_source(self) -> "UpdateApiKey":
+        return _validate_key_source(self)
+
     model_config = ConfigDict(
         from_attributes=True,
     )
 
 
 class CreateClassCredential(BaseModel):
-    api_key: str
-    provider: ClassCredentialProvider
+    api_key: str | None = None
+    api_key_id: int | None = Field(None, gt=0)
+    provider: ClassCredentialProvider | None = None
     purpose: ClassCredentialPurpose
 
     @field_validator("api_key")
     @classmethod
-    def strip_api_key(cls, v: str) -> str:
+    def strip_api_key(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
         v = v.strip()
         if not v:
             raise ValueError("api_key must not be empty")
         return v
+
+    @model_validator(mode="after")
+    def validate_key_source(self) -> "CreateClassCredential":
+        return _validate_key_source(self)
 
     model_config = ConfigDict(
         from_attributes=True,

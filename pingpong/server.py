@@ -2870,6 +2870,19 @@ def _class_ai_provider(class_: models.Class) -> schemas.AIProvider | None:
     return None
 
 
+async def _get_default_api_key_or_404(
+    session: AsyncSession, api_key_id: int
+) -> models.APIKey:
+    api_key_obj = await models.APIKey.get_by_id(session, api_key_id)
+    if api_key_obj is None:
+        raise HTTPException(status_code=404, detail="API key not found")
+    if not api_key_obj.available_as_default:
+        raise HTTPException(
+            status_code=400, detail="API key is not available as default"
+        )
+    return api_key_obj
+
+
 async def _get_class_api_key_read_context(
     session: AsyncSession,
     class_id: int,
@@ -3048,12 +3061,34 @@ async def create_class_credential(
     request: StateRequest,
 ):
     purpose = update.purpose
-    if not update.api_key:
+    provider = update.provider
+    api_key_obj: models.APIKey | None = None
+    if update.api_key_id is not None:
+        if not await (Authz("admin") | ClassInstitutionAdmin()).test(request):
+            raise HTTPException(status_code=404, detail="API key not found")
+        api_key_obj = await _get_default_api_key_or_404(
+            request.state["db"], update.api_key_id
+        )
+        try:
+            provider = schemas.ClassCredentialProvider(api_key_obj.provider)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Default API key provider {api_key_obj.provider} is not supported "
+                    "for class feature credentials."
+                ),
+            ) from exc
+    elif not update.api_key:
         raise HTTPException(
             status_code=400,
             detail="API key must be provided to create the class credential.",
         )
-    if not provider_matches_purpose(update.provider, purpose):
+
+    if provider is None:
+        raise HTTPException(status_code=400, detail="Provider must be specified.")
+
+    if not provider_matches_purpose(provider, purpose):
         expected_provider = expected_provider_for_purpose(purpose)
         raise HTTPException(
             status_code=400,
@@ -3070,28 +3105,44 @@ async def create_class_credential(
             detail="Credential already exists for this purpose and cannot be changed.",
         )
     try:
-        is_valid = await validate_class_credential(update.api_key, update.provider)
-    except ClassCredentialValidationUnavailableError as exc:
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "Unable to validate the API key right now because the provider is unavailable. "
-                "Please try again later."
-            ),
-        ) from exc
-    if not is_valid:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid API key provided. Please try again.",
-        )
-    try:
-        credential = await models.ClassCredential.create(
-            request.state["db"],
-            int(class_id),
-            purpose,
-            update.api_key,
-            update.provider,
-        )
+        if api_key_obj is not None:
+            credential = await models.ClassCredential.create_from_api_key_id(
+                request.state["db"],
+                int(class_id),
+                purpose,
+                api_key_obj.id,
+            )
+            if credential is None:
+                raise HTTPException(status_code=404, detail="API key not found")
+        else:
+            api_key_value = update.api_key
+            if api_key_value is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="API key must be provided to create the class credential.",
+                )
+            try:
+                is_valid = await validate_class_credential(api_key_value, provider)
+            except ClassCredentialValidationUnavailableError as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "Unable to validate the API key right now because the provider is unavailable. "
+                        "Please try again later."
+                    ),
+                ) from exc
+            if not is_valid:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid API key provided. Please try again.",
+                )
+            credential = await models.ClassCredential.create(
+                request.state["db"],
+                int(class_id),
+                purpose,
+                api_key_value,
+                provider,
+            )
     except (IntegrityError, models.ClassCredentialAlreadyExistsError) as exc:
         raise HTTPException(
             status_code=400,
@@ -3117,36 +3168,92 @@ async def create_class_credential(
 async def update_class_api_key(
     class_id: str, update: schemas.UpdateApiKey, request: StateRequest
 ):
+    class_ = await models.Class.get_api_key(request.state["db"], int(class_id))
+    if not class_:
+        raise HTTPException(status_code=404, detail="Class not found")
+    if update.api_key_id is not None:
+        if not await (Authz("admin") | ClassInstitutionAdmin()).test(request):
+            raise HTTPException(status_code=404, detail="API key not found")
+
+        api_key_obj = await _get_default_api_key_or_404(
+            request.state["db"], update.api_key_id
+        )
+        try:
+            schemas.AIProvider(api_key_obj.provider)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Default API key provider {api_key_obj.provider} is not supported "
+                    "for class billing."
+                ),
+            ) from exc
+
+        if class_.api_key_obj and class_.api_key_obj.id == api_key_obj.id:
+            return {
+                "api_key": schemas.RedactedApiKey.from_raw(
+                    class_.api_key_obj.api_key,
+                    class_.api_key_obj.provider,
+                    class_.api_key_obj.endpoint,
+                    class_.api_key_obj.api_version,
+                    class_.api_key_obj.available_as_default,
+                )
+            }
+        if class_.api_key_obj or class_.api_key:
+            raise HTTPException(
+                status_code=400,
+                detail="API key already exists. Delete it first to create a new one.",
+            )
+        updated_api_key_obj = await models.Class.update_api_key_by_id(
+            request.state["db"], int(class_id), api_key_obj.id
+        )
+        if updated_api_key_obj is None:
+            raise HTTPException(status_code=404, detail="API key not found")
+        await request.state["authz"].write_safe(
+            grant=[
+                (
+                    f"user:{request.state['session'].user.id}",
+                    "can_view_api_key",
+                    f"class:{class_id}",
+                )
+            ]
+        )
+        return {"api_key": schemas.RedactedApiKey.from_api_key_obj(updated_api_key_obj)}
+
     if not update.api_key:
         raise HTTPException(
             status_code=400,
             detail="API key must be provided to update the class API key.",
         )
-    existing_key = await models.Class.get_api_key(request.state["db"], int(class_id))
+    if update.provider is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Provider must be provided to update the class API key.",
+        )
     if (
-        existing_key.api_key_obj
-        and existing_key.api_key_obj.api_key == update.api_key
-        and existing_key.api_key_obj.provider == update.provider
-        and existing_key.api_key_obj.endpoint == update.endpoint
-        and existing_key.api_key_obj.api_version == update.api_version
+        class_.api_key_obj
+        and class_.api_key_obj.api_key == update.api_key
+        and class_.api_key_obj.provider == update.provider
+        and class_.api_key_obj.endpoint == update.endpoint
+        and class_.api_key_obj.api_version == update.api_version
     ):
         return {
             "api_key": schemas.RedactedApiKey.from_raw(
-                existing_key.api_key_obj.api_key,
-                existing_key.api_key_obj.provider,
-                existing_key.api_key_obj.endpoint,
-                existing_key.api_key_obj.api_version,
-                existing_key.api_key_obj.available_as_default,
+                class_.api_key_obj.api_key,
+                class_.api_key_obj.provider,
+                class_.api_key_obj.endpoint,
+                class_.api_key_obj.api_version,
+                class_.api_key_obj.available_as_default,
             )
         }
-    if existing_key.api_key == update.api_key:
+    if class_.api_key == update.api_key:
         return {
             "api_key": schemas.RedactedApiKey.from_raw(
-                existing_key.api_key,
+                class_.api_key,
                 "openai",
             )
         }
-    elif not existing_key.api_key_obj and not existing_key.api_key:
+    elif not class_.api_key_obj and not class_.api_key:
         response = await validate_api_key(
             update.api_key,
             update.provider.value,
