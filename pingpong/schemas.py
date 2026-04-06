@@ -518,9 +518,35 @@ class LectureVideoManifestQuestionV1(BaseModel):
         return self
 
 
-class LectureVideoManifestV1(BaseModel):
-    version: Literal[1] = 1
+class LectureVideoManifestBase(BaseModel):
     questions: list[LectureVideoManifestQuestionV1] = Field(..., min_length=1)
+
+
+class LectureVideoManifestV1(LectureVideoManifestBase):
+    version: Literal[1] = 1
+
+
+class LectureVideoManifestWordV2(BaseModel):
+    id: str = Field(..., min_length=1)
+    word: str = Field(..., min_length=1)
+    start: int | float = Field(..., ge=0)
+    end: int | float = Field(..., ge=0)
+
+    @model_validator(mode="after")
+    def validate_range(self) -> "LectureVideoManifestWordV2":
+        if self.end < self.start:
+            raise ValueError("end must be greater than or equal to start")
+        return self
+
+
+class LectureVideoManifestV2(LectureVideoManifestBase):
+    version: Literal[2] = 2
+    word_level_transcription: list[LectureVideoManifestWordV2] = Field(
+        ..., min_length=1
+    )
+
+
+LectureVideoManifest: TypeAlias = LectureVideoManifestV1 | LectureVideoManifestV2
 
 
 def _lecture_video_manifest_error_detail(exc: ValidationError) -> str:
@@ -531,20 +557,33 @@ def _lecture_video_manifest_error_detail(exc: ValidationError) -> str:
     return "; ".join(errors)
 
 
-def _validate_lecture_video_manifest(
-    lecture_video_manifest: LectureVideoManifestV1 | Any | None,
-) -> LectureVideoManifestV1 | None:
+def validate_lecture_video_manifest(
+    lecture_video_manifest: LectureVideoManifest | Any | None,
+) -> LectureVideoManifest | None:
     if lecture_video_manifest is None or isinstance(
-        lecture_video_manifest, LectureVideoManifestV1
+        lecture_video_manifest, (LectureVideoManifestV1, LectureVideoManifestV2)
     ):
         return lecture_video_manifest
     try:
+        version = (
+            lecture_video_manifest.get("version")
+            if isinstance(lecture_video_manifest, dict)
+            else None
+        )
+        if version == 2:
+            return LectureVideoManifestV2.model_validate(lecture_video_manifest)
         return LectureVideoManifestV1.model_validate(lecture_video_manifest)
     except ValidationError as exc:
         raise ValueError(
             "Invalid lecture video manifest. "
             f"{_lecture_video_manifest_error_detail(exc)}"
         ) from exc
+
+
+def _validate_lecture_video_manifest(
+    lecture_video_manifest: LectureVideoManifest | Any | None,
+) -> LectureVideoManifest | None:
+    return validate_lecture_video_manifest(lecture_video_manifest)
 
 
 class LectureVideoSummary(BaseModel):
@@ -564,8 +603,9 @@ class LectureVideoAssistantEditorPolicy(BaseModel):
 
 class LectureVideoConfigResponse(BaseModel):
     lecture_video: LectureVideoSummary
-    lecture_video_manifest: LectureVideoManifestV1
+    lecture_video_manifest: LectureVideoManifest
     voice_id: str
+    lecture_video_chat_available: bool = False
 
 
 class ValidateLectureVideoVoiceRequest(BaseModel):
@@ -633,6 +673,7 @@ class LectureVideoSessionController(BaseModel):
 
 class LectureVideoSession(BaseModel):
     state: LectureVideoSessionState
+    lecture_video_chat_available: bool = False
     last_known_offset_ms: int | None = None
     furthest_offset_ms: int | None = Field(None, ge=0)
     latest_interaction_at: datetime | None = None
@@ -957,7 +998,7 @@ class CreateAssistant(BaseModel):
     verbosity: int | None = Field(None, ge=0, le=2)
     tools: list[ToolOption] = Field(default_factory=list)
     lecture_video_id: int | None = None
-    lecture_video_manifest: LectureVideoManifestV1 | None = None
+    lecture_video_manifest: LectureVideoManifest | None = None
     voice_id: str | None = None
     published: bool = False
     use_latex: bool = False
@@ -982,7 +1023,7 @@ class CreateAssistant(BaseModel):
     @field_validator("lecture_video_manifest", mode="before")
     @classmethod
     def validate_lecture_video_manifest(cls, value):
-        return _validate_lecture_video_manifest(value)
+        return validate_lecture_video_manifest(value)
 
     @field_validator("voice_id")
     @classmethod
@@ -1034,7 +1075,7 @@ class UpdateAssistant(BaseModel):
     notes: str | None = None
     interaction_mode: InteractionMode | None = None
     lecture_video_id: int | None = None
-    lecture_video_manifest: LectureVideoManifestV1 | None = None
+    lecture_video_manifest: LectureVideoManifest | None = None
     voice_id: str | None = None
     model: str | None = Field(None, min_length=2)
     temperature: float | None = Field(None, ge=0.0, le=2.0)
@@ -1064,7 +1105,7 @@ class UpdateAssistant(BaseModel):
     @field_validator("lecture_video_manifest", mode="before")
     @classmethod
     def validate_lecture_video_manifest(cls, value):
-        return _validate_lecture_video_manifest(value)
+        return validate_lecture_video_manifest(value)
 
     @field_validator("voice_id")
     @classmethod

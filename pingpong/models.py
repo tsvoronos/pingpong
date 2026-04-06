@@ -29,6 +29,7 @@ from sqlalchemy import (
     asc,
     desc,
     distinct,
+    false,
     literal,
     not_,
     or_,
@@ -40,6 +41,7 @@ from sqlalchemy import (
     ForeignKeyConstraint,
     Index,
     Integer,
+    JSON,
     String,
     Table,
     and_,
@@ -59,11 +61,13 @@ from sqlalchemy.orm import (
     Load,
     joinedload,
     contains_eager,
+    deferred,
     load_only,
     selectinload,
     mapped_column,
     relationship,
     defer,
+    undefer,
 )
 from sqlalchemy.sql import func
 import pingpong.schemas as schemas
@@ -2061,6 +2065,13 @@ class LectureVideo(Base):
     )
     display_name = Column(String)
     voice_id = Column(String, nullable=True)
+    manifest_data: Mapped[dict[str, Any] | None] = deferred(
+        mapped_column(JSON, nullable=True)
+    )
+    manifest_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    lecture_video_chat_available: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="false"
+    )
     status = Column(
         SQLEnum(schemas.LectureVideoStatus),
         nullable=False,
@@ -2081,6 +2092,9 @@ class LectureVideo(Base):
         user_id: int | None,
         display_name: str | None = None,
         voice_id: str | None = None,
+        manifest_data: dict[str, Any] | None = None,
+        manifest_version: int | None = None,
+        lecture_video_chat_available: bool = False,
         source_lecture_video_id_snapshot: int | None = None,
         status: schemas.LectureVideoStatus = schemas.LectureVideoStatus.UPLOADED,
         error_message: str | None = None,
@@ -2090,6 +2104,9 @@ class LectureVideo(Base):
             stored_object_id=stored_object_id,
             display_name=display_name,
             voice_id=voice_id,
+            manifest_data=manifest_data,
+            manifest_version=manifest_version,
+            lecture_video_chat_available=lecture_video_chat_available,
             source_lecture_video_id_snapshot=source_lecture_video_id_snapshot,
             status=status,
             error_message=error_message,
@@ -2129,6 +2146,7 @@ class LectureVideo(Base):
         stmt = (
             select(LectureVideo)
             .where(LectureVideo.id == id_)
+            .options(undefer(LectureVideo.manifest_data))
             .options(selectinload(LectureVideo.stored_object))
             .options(
                 selectinload(LectureVideo.questions).selectinload(
@@ -2237,6 +2255,9 @@ class LectureVideo(Base):
             # target classes share the same AI provider and additional provider
             # credentials, including ElevenLabs.
             voice_id=lecture_video.voice_id,
+            manifest_data=lecture_video.manifest_data,
+            manifest_version=lecture_video.manifest_version,
+            lecture_video_chat_available=lecture_video.lecture_video_chat_available,
             source_lecture_video_id_snapshot=lecture_video.id,
             status=lecture_video.status,
             error_message=lecture_video.error_message,
@@ -2623,9 +2644,11 @@ def _thread_lecture_video_base_loaders() -> tuple[Load, ...]:
             Assistant.id, Assistant.name, Assistant.lecture_video_id
         ),
         selectinload(Thread.lecture_video).options(
+            undefer(LectureVideo.manifest_data),
+            selectinload(LectureVideo.stored_object),
             selectinload(LectureVideo.questions).options(
                 *_lecture_video_question_context_loaders()
-            )
+            ),
         ),
     )
 
@@ -2676,6 +2699,9 @@ class LectureVideoThreadState(Base):
         Integer, nullable=False, server_default="0"
     )
     furthest_offset_ms: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0"
+    )
+    last_chat_context_end_ms: Mapped[int] = mapped_column(
         Integer, nullable=False, server_default="0"
     )
     version: Mapped[int] = mapped_column(Integer, nullable=False, server_default="1")
@@ -3836,8 +3862,9 @@ class Assistant(Base):
         return (
             selectinload(Assistant.code_interpreter_files),
             selectinload(Assistant.mcp_server_tools),
-            selectinload(Assistant.lecture_video).selectinload(
-                LectureVideo.stored_object
+            selectinload(Assistant.lecture_video).options(
+                undefer(LectureVideo.manifest_data),
+                selectinload(LectureVideo.stored_object),
             ),
             selectinload(Assistant.lecture_video).selectinload(LectureVideo.questions),
             selectinload(Assistant.lecture_video)
@@ -6440,6 +6467,7 @@ class Message(Base):
     )
 
     output_index = Column(Integer, nullable=False)
+    is_hidden = Column(Boolean, server_default=false())
 
     role = Column(SQLEnum(schemas.MessageRole), nullable=False)
     phase = Column(String, nullable=True)
@@ -7148,8 +7176,12 @@ class Thread(Base):
         return thread
 
     @classmethod
-    async def get_by_id(cls, session: AsyncSession, id_: int) -> "Thread":
+    async def get_by_id(
+        cls, session: AsyncSession, id_: int, *, for_update: bool = False
+    ) -> "Thread":
         stmt = select(Thread).where(Thread.id == int(id_))
+        if for_update:
+            stmt = stmt.with_for_update()
         return await session.scalar(stmt)
 
     @classmethod
@@ -8094,6 +8126,7 @@ class Thread(Base):
         thread_id: int,
         run_ids: Collection[int],
         order: Literal["asc", "desc"] = "desc",
+        include_hidden_messages: bool = False,
     ) -> tuple[list["Message"], list["ToolCall"], list["ReasoningStep"]]:
         if not run_ids:
             return [], [], []
@@ -8112,12 +8145,21 @@ class Thread(Base):
             else desc(ReasoningStep.output_index)
         )
 
+        message_filters = [
+            Message.thread_id == thread_id,
+            Message.run_id.in_(run_ids),
+        ]
+        if not include_hidden_messages:
+            message_filters.append(Message.is_hidden.is_(False))
+            message_filters.append(
+                Message.role.not_in(
+                    [schemas.MessageRole.DEVELOPER, schemas.MessageRole.SYSTEM]
+                )
+            )
+
         messages = await session.execute(
             select(Message)
-            .where(
-                Message.thread_id == thread_id,
-                Message.run_id.in_(run_ids),
-            )
+            .where(*message_filters)
             .order_by(ordering)
             .options(
                 selectinload(Message.content).selectinload(MessagePart.annotations),

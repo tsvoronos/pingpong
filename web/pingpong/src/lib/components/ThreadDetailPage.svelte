@@ -11,6 +11,7 @@
 	} from '$lib/stores/anonymous';
 	import { happyToast, sadToast } from '$lib/toast';
 	import { errorMessage } from '$lib/errors';
+	import { scroll } from '$lib/actions/scroll';
 	import { computeLatestIncidentTimestamps, filterLatestIncidentUpdates } from '$lib/statusUpdates';
 	import { blur } from 'svelte/transition';
 	import {
@@ -77,8 +78,10 @@
 	import MCPServerCallItem from './MCPServerCallItem.svelte';
 	import ReasoningCallItem from './ReasoningCallItem.svelte';
 	import WebSearchCallItem from './WebSearchCallItem.svelte';
-	import LectureVideoView from '$lib/components/lecture-video/LectureVideoView.svelte';
-	import LectureVideoCompletedView from '$lib/components/lecture-video/LectureVideoCompletedView.svelte';
+	import LectureVideoView, {
+		type LectureVideoViewHandle
+	} from '$lib/components/lecture-video/LectureVideoView.svelte';
+	import LectureVideoChatPanel from '$lib/components/lecture-video/LectureVideoChatPanel.svelte';
 
 	function formatLectureVideoTitle(filename: string | null | undefined): string | null {
 		if (!filename) return null;
@@ -147,8 +150,23 @@
 	$: threadIsCurrentUserParticipant =
 		expandedThreadData.data?.thread?.is_current_user_participant === true;
 	$: lectureVideoSession = expandedThreadData.data?.lecture_video_session ?? null;
+	$: threadLectureChatAvailable = lectureVideoSession?.lecture_video_chat_available === true;
 	$: effectiveLectureVideoMismatch = threadLectureVideoMismatch;
 	$: effectiveLectureVideoAssistantMismatch = threadLectureVideoMismatch;
+	let lectureVideoViewRef: LectureVideoViewHandle | null = null;
+	let lectureChatHasDraft = false;
+	let liveLectureVideoSession: api.LectureVideoSession | null = null;
+	let lectureVideoSessionKey: string | null = null;
+	$: {
+		const nextKey = `${classId}:${threadId}:${lectureVideoSession?.state_version ?? 'none'}:${
+			lectureVideoSession?.state ?? 'none'
+		}`;
+		if (lectureVideoSessionKey !== nextKey) {
+			lectureVideoSessionKey = nextKey;
+			liveLectureVideoSession = lectureVideoSession;
+		}
+	}
+	$: effectiveLectureVideoSession = liveLectureVideoSession ?? lectureVideoSession;
 	let trashThreadFiles = writable<string[]>([]);
 	let allFiles: Record<string, api.FileUploadInfo> = {};
 	$: threadAttachments = threadMgr.attachments;
@@ -247,6 +265,14 @@
 	$: chatFileSearchAcceptedFiles = allowUserFileUploads ? fileSearchAcceptedFiles : null;
 	$: chatCodeInterpreterAcceptedFiles = allowUserFileUploads ? codeInterpreterAcceptedFiles : null;
 	$: chatInputDisabled = !canSubmit || assistantDeleted || !!$navigating || !canViewAssistant;
+	$: lectureChatCanSubmit =
+		canSubmit && threadIsCurrentUserParticipant && !assistantDeleted && canViewAssistant;
+	$: lectureChatInputDisabled =
+		!lectureChatCanSubmit ||
+		!!$navigating ||
+		!threadLectureChatAvailable ||
+		effectiveLectureVideoSession?.state === 'awaiting_answer' ||
+		effectiveLectureVideoSession?.state === 'completed';
 	$: canDropUploadsIntoThread =
 		data.threadInteractionMode === 'chat' &&
 		assistantInteractionMode === 'chat' &&
@@ -557,151 +583,6 @@
 
 		return '';
 	};
-
-	// Scroll to the bottom of the chat thread.
-	const scroll = (el: HTMLDivElement, params: { messages: Message[]; threadId: number }) => {
-		const scrollEl = el;
-		let lastScrollTop = scrollEl.scrollTop;
-		let userPausedAutoScroll = false;
-		let isProgrammaticScroll = false;
-		let settleFrame: number | null = null;
-		let settlePassesRemaining = 0;
-		let lastKnownScrollHeight = scrollEl.scrollHeight;
-		let lastMessageId: string | null = params.messages[params.messages.length - 1]?.data.id ?? null;
-		let currentThreadId = params.threadId;
-
-		const scrollToBottom = () => {
-			isProgrammaticScroll = true;
-			scrollEl.scrollTo({
-				top: scrollEl.scrollHeight,
-				behavior: 'smooth'
-			});
-			requestAnimationFrame(() => {
-				lastScrollTop = scrollEl.scrollTop;
-				lastKnownScrollHeight = scrollEl.scrollHeight;
-				isProgrammaticScroll = false;
-			});
-		};
-
-		const cancelSettledScroll = () => {
-			if (settleFrame !== null) {
-				cancelAnimationFrame(settleFrame);
-				settleFrame = null;
-			}
-			settlePassesRemaining = 0;
-		};
-
-		const scheduleScrollToBottom = (passes = 6) => {
-			if (userPausedAutoScroll) {
-				return;
-			}
-
-			settlePassesRemaining = Math.max(settlePassesRemaining, passes);
-			if (settleFrame !== null) {
-				return;
-			}
-
-			const run = () => {
-				settleFrame = null;
-				if (userPausedAutoScroll) {
-					settlePassesRemaining = 0;
-					return;
-				}
-
-				const scrollHeightChanged = scrollEl.scrollHeight !== lastKnownScrollHeight;
-				scrollToBottom();
-				lastKnownScrollHeight = scrollEl.scrollHeight;
-				settlePassesRemaining -= 1;
-				if (scrollHeightChanged) {
-					settlePassesRemaining = Math.max(settlePassesRemaining, 2);
-				}
-				if (settlePassesRemaining > 0) {
-					settleFrame = requestAnimationFrame(run);
-				}
-			};
-
-			settleFrame = requestAnimationFrame(run);
-		};
-
-		const onScroll = () => {
-			if (isProgrammaticScroll) {
-				lastScrollTop = scrollEl.scrollTop;
-				return;
-			}
-			const isScrollingDown = scrollEl.scrollTop > lastScrollTop;
-			const isScrollingUp = scrollEl.scrollTop < lastScrollTop - 5;
-			const distanceFromBottom = scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight;
-
-			// Pause auto-scroll on upward scroll
-			if (isScrollingUp) {
-				userPausedAutoScroll = true;
-			}
-			// Resume auto-scroll only when scrolling down and near the bottom
-			if (userPausedAutoScroll && isScrollingDown && distanceFromBottom < 50) {
-				userPausedAutoScroll = false;
-			}
-			if (!userPausedAutoScroll && distanceFromBottom < 50) {
-				scheduleScrollToBottom(2);
-			}
-			lastScrollTop = scrollEl.scrollTop;
-		};
-
-		const mutationObserver = new MutationObserver(() => {
-			scheduleScrollToBottom(4);
-		});
-		const onDescendantLoad = () => {
-			scheduleScrollToBottom(4);
-		};
-
-		scrollEl.addEventListener('scroll', onScroll, { passive: true });
-		scrollEl.addEventListener('load', onDescendantLoad, true);
-		mutationObserver.observe(scrollEl, {
-			childList: true,
-			subtree: true,
-			characterData: true
-		});
-		scheduleScrollToBottom();
-
-		return {
-			update: (nextParams: { messages: Message[]; threadId: number }) => {
-				// Reset scroll state when navigating to a different thread
-				if (nextParams.threadId !== currentThreadId) {
-					currentThreadId = nextParams.threadId;
-					userPausedAutoScroll = false;
-					lastMessageId = null;
-					lastScrollTop = 0;
-					lastKnownScrollHeight = scrollEl.scrollHeight;
-					scheduleScrollToBottom();
-					return;
-				}
-
-				const nextMessages = nextParams.messages;
-				const nextLastMessage = nextMessages[nextMessages.length - 1];
-				const nextLastMessageId = nextLastMessage?.data.id ?? null;
-				const hasNewTailMessage = nextLastMessageId && nextLastMessageId !== lastMessageId;
-				const isCurrentUserTail =
-					nextLastMessage?.data.role === 'user' &&
-					nextLastMessage?.data.metadata?.is_current_user === true;
-				lastMessageId = nextLastMessageId;
-				requestAnimationFrame(() => {
-					// Force scroll when user sends a new message
-					if (hasNewTailMessage && isCurrentUserTail) {
-						userPausedAutoScroll = false;
-					}
-					if (!userPausedAutoScroll) {
-						scheduleScrollToBottom();
-					}
-				});
-			},
-			destroy: () => {
-				cancelSettledScroll();
-				mutationObserver.disconnect();
-				scrollEl.removeEventListener('load', onDescendantLoad, true);
-				scrollEl.removeEventListener('scroll', onScroll);
-			}
-		};
-	};
-
 	// Fetch an earlier page of messages
 	const fetchMoreMessages = async () => {
 		await threadMgr.fetchMore();
@@ -817,6 +698,21 @@
 		await postMessage(e.detail);
 	};
 
+	const handleLectureChatSubmit = async (message: ChatInputMessage) => {
+		await postMessage(message);
+	};
+
+	const handleLectureSessionChange = (e: CustomEvent<api.LectureVideoSession>) => {
+		liveLectureVideoSession = e.detail;
+	};
+
+	const handleLectureChatDraftChange = ({ hasText }: { hasText: boolean }) => {
+		lectureChatHasDraft = hasText;
+		if (hasText) {
+			void lectureVideoViewRef?.pauseForChatInput();
+		}
+	};
+
 	// Handle file upload
 	const handleUpload = (
 		f: File,
@@ -844,6 +740,10 @@
 	};
 
 	const handleDismissError = () => {
+		threadMgr.dismissError();
+	};
+
+	const handleLectureChatDismissError = () => {
 		threadMgr.dismissError();
 	};
 
@@ -1573,17 +1473,52 @@
 						{/if}
 					</div>
 				</div>
-			{:else if threadLectureVideoCompleted}
-				<LectureVideoCompletedView {classId} {threadId} />
 			{:else}
 				<LectureVideoView
+					bind:this={lectureVideoViewRef}
 					{classId}
 					{threadId}
 					{lectureVideoSrc}
 					title={lectureVideoDisplayTitle}
 					canParticipate={threadIsCurrentUserParticipant}
 					initialSession={lectureVideoSession}
-				/>
+					deferAutoContinueForChatDraft={lectureChatHasDraft}
+					chatAvailable={threadLectureChatAvailable}
+					on:sessionchange={handleLectureSessionChange}
+				>
+					{#snippet chat()}
+						{#if threadLectureChatAvailable}
+							<LectureVideoChatPanel
+								{classId}
+								{threadId}
+								messages={$messages}
+								canFetchMore={$canFetchMore}
+								showInput={effectiveLectureVideoSession?.state !== 'completed'}
+								canSubmit={lectureChatCanSubmit}
+								disabled={lectureChatInputDisabled}
+								waiting={$waiting}
+								submitting={$submitting}
+								{threadManagerError}
+								{assistantDeleted}
+								{canViewAssistant}
+								{resolvedAssistantVersion}
+								version={$version}
+								{useLatex}
+								{userTimezone}
+								meName={data?.me?.user?.name || data?.me?.user?.email || 'Me'}
+								meImage={data?.me?.profile?.image_url || ''}
+								assistantId={$assistantId}
+								participants={$participants}
+								mimeType={data.uploadInfo.mimeType}
+								{fetchMoreMessages}
+								onsubmit={handleLectureChatSubmit}
+								ondismisserror={handleLectureChatDismissError}
+								ontextinput={handleLectureChatDraftChange}
+								ontextpaste={handleLectureChatDraftChange}
+							/>
+						{/if}
+					{/snippet}
+				</LectureVideoView>
 			{/if}
 		{/key}
 	{:else}
@@ -1592,7 +1527,7 @@
 				data.isSharedAssistantPage || data.isSharedThreadPage ? 'pt-10' : ''
 			}`}
 			bind:this={messagesContainer}
-			use:scroll={{ messages: $messages, threadId }}
+			use:scroll={{ messages: $messages, threadId, streaming: $submitting || $waiting }}
 		>
 			<div class="print-only print-header mx-2">
 				<div class="print-header__brand">

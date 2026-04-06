@@ -123,6 +123,7 @@
 	type LectureVideoManifestInput = {
 		version?: number;
 		questions: LectureVideoQuestionInput[];
+		word_level_transcription?: { id: string; word: string; start: number; end: number }[];
 	};
 
 	// Flag indicating whether we should check for changes before navigating away.
@@ -214,6 +215,7 @@
 	let refreshingLectureVideoStatus = false;
 	let canRefreshCurrentLectureVideoStatus = false;
 	let lectureVideoManifestJson = '';
+	let lectureVideoChatUnavailable = false;
 	let hasSetLectureVideoManifest = false;
 	let currentVoiceId = data.lectureVideoConfig?.voice_id || '';
 	let voiceId = '';
@@ -273,6 +275,29 @@
 		}
 	};
 
+	const lectureVideoChatUnavailableForManifest = (manifest: unknown) => {
+		if (!manifest || typeof manifest !== 'object') {
+			return null;
+		}
+
+		const candidate = manifest as Partial<LectureVideoManifestInput>;
+		const hasWordLevelTranscription =
+			Array.isArray(candidate.word_level_transcription) &&
+			candidate.word_level_transcription.length > 0;
+
+		if (candidate.version === 1) {
+			return true;
+		}
+		if (candidate.version === 2) {
+			return !hasWordLevelTranscription;
+		}
+		if (candidate.word_level_transcription !== undefined) {
+			return !hasWordLevelTranscription;
+		}
+
+		return null;
+	};
+
 	// Keep this client-side validation aligned with pingpong/schemas.py:
 	// LectureVideoManifestV1, LectureVideoManifestQuestionV1, and LectureVideoManifestOptionV1.
 	const parseLectureVideoManifest = (
@@ -290,10 +315,10 @@
 		}
 
 		const candidate = parsed as Partial<LectureVideoManifestInput>;
-		if (candidate.version !== undefined && candidate.version !== 1) {
+		if (candidate.version !== undefined && candidate.version !== 1 && candidate.version !== 2) {
 			return {
 				manifest: null,
-				error: 'Lecture video manifest version must be 1.'
+				error: 'Lecture video manifest version must be 1 or 2.'
 			};
 		}
 		if (!Array.isArray(candidate.questions) || candidate.questions.length < 1) {
@@ -377,6 +402,54 @@
 			}
 		}
 
+		const hasWordLevelTranscription = candidate.word_level_transcription !== undefined;
+		const shouldUseV2Manifest = candidate.version === 2 || hasWordLevelTranscription;
+
+		if (shouldUseV2Manifest) {
+			if (
+				!Array.isArray(candidate.word_level_transcription) ||
+				candidate.word_level_transcription.length < 1
+			) {
+				return {
+					manifest: null,
+					error: 'Lecture video manifest version 2 must include non-empty word_level_transcription.'
+				};
+			}
+
+			for (let index = 0; index < candidate.word_level_transcription.length; index += 1) {
+				const word = candidate.word_level_transcription[index];
+				if (
+					!word ||
+					typeof word !== 'object' ||
+					typeof word.id !== 'string' ||
+					word.id.length < 1 ||
+					typeof word.word !== 'string' ||
+					word.word.length < 1 ||
+					typeof word.start !== 'number' ||
+					!Number.isFinite(word.start) ||
+					word.start < 0 ||
+					typeof word.end !== 'number' ||
+					!Number.isFinite(word.end) ||
+					word.end < 0 ||
+					word.end < word.start
+				) {
+					return {
+						manifest: null,
+						error: `word_level_transcription entry ${index + 1} is invalid.`
+					};
+				}
+			}
+
+			return {
+				manifest: {
+					version: 2,
+					questions: candidate.questions,
+					word_level_transcription: candidate.word_level_transcription
+				} as api.LectureVideoManifest,
+				error: null
+			};
+		}
+
 		return {
 			manifest: {
 				version: 1,
@@ -395,6 +468,20 @@
 	$: currentLectureVideoManifestNormalized = normalizeLectureVideoManifestForCompare(
 		stringifyLectureVideoManifest(data.lectureVideoConfig?.lecture_video_manifest)
 	);
+	$: lectureVideoChatUnavailable = (() => {
+		try {
+			const manifestState = lectureVideoChatUnavailableForManifest(
+				JSON.parse(lectureVideoManifestJson)
+			);
+			if (manifestState !== null) {
+				return manifestState;
+			}
+		} catch {
+			// Fall back to persisted availability when the draft is not valid JSON yet.
+		}
+
+		return data.lectureVideoConfig?.lecture_video_chat_available === false;
+	})();
 	$: if (!hasSetVoiceId && !lectureVideoConfigLoadError) {
 		voiceId = currentVoiceId;
 		hasSetVoiceId = true;
@@ -2452,6 +2539,12 @@
 					offsets, at least two options per question, and exactly one correct option for
 					single-select questions.</Helper
 				>
+				{#if lectureVideoChatUnavailable}
+					<Helper class="pb-2 text-amber-700">
+						Lecture chat is only available for lecture videos with a version 2 manifest that
+						includes word-level transcription.
+					</Helper>
+				{/if}
 				<Textarea
 					id="lecture_video_manifest"
 					name="lecture_video_manifest"
