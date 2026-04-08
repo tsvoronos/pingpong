@@ -168,6 +168,49 @@ def make_root(email: str) -> None:
     asyncio.run(_make_root())
 
 
+@auth.command("remove_root")
+@click.argument("email")
+def remove_root(email: str) -> None:
+    async def _remove_root() -> None:
+        await config.authz.driver.init()
+        async with config.db.driver.async_session() as session:
+            user = await User.get_by_email(session, email)
+            if not user:
+                raise click.ClickException(f"User with email {email} not found")
+
+            user_id = user.id
+            was_super_admin = bool(user.super_admin)
+            had_root_tuple = False
+
+            async with config.authz.driver.get_client() as c:
+                tuples = await c.read_tuples(
+                    "admin",
+                    c.root,
+                    user=f"user:{user_id}",
+                )
+                had_root_tuple = bool(tuples)
+
+                if not was_super_admin and not had_root_tuple:
+                    raise click.ClickException(f"User {user_id} is not a root admin")
+
+                await c.write_safe(revoke=[(f"user:{user_id}", "admin", c.root)])
+
+            if was_super_admin:
+                user.super_admin = False
+                session.add(user)
+                await session.commit()
+
+            if had_root_tuple:
+                logger.info(f"User {user_id} demoted from root")
+            else:
+                logger.info(
+                    f"User {user_id} demoted from root (DB flag only; no root authz tuple found)"
+                )
+            logger.info("Done!")
+
+    asyncio.run(_remove_root())
+
+
 @auth.command("update_model")
 def update_model() -> None:
     async def _update_model() -> None:
