@@ -3169,11 +3169,20 @@ class File(Base):
 
     @classmethod
     async def get_all_by_id(cls, session: AsyncSession, ids: list[int]) -> list["File"]:
-        if not ids:
-            return []
-        stmt = select(File).where(File.id.in_(ids))
+        return await cls.get_all_by_ids_if_exist(session, ids)
+
+    @classmethod
+    async def get_file_ids_for_class(
+        cls, session: AsyncSession, class_id: int, file_ids: list[int]
+    ) -> set[int]:
+        if not file_ids:
+            return set()
+        stmt = select(file_class_association.c.file_id).where(
+            file_class_association.c.class_id == class_id,
+            file_class_association.c.file_id.in_(file_ids),
+        )
         result = await session.execute(stmt)
-        return [row.File for row in result]
+        return {row[0] for row in result}
 
     @classmethod
     async def get_all_by_file_id(

@@ -529,6 +529,58 @@ async def test_create_assistant_rejects_gpt_5_4_temperature_without_reasoning_no
 
 
 @with_user(123)
+@with_authz(grants=[("user:123", "can_create_assistants", "class:1")])
+async def test_create_assistant_rejects_unauthorized_deleted_private_files(
+    api, db, valid_user_token, monkeypatch
+):
+    async def fake_list_class_models(class_id: str, request, openai_client):  # type: ignore[no-untyped-def]
+        return _fake_class_models_response(
+            model_id="gpt-5.4",
+            model_name="GPT-5.4",
+            supports_temperature=False,
+            supports_reasoning=True,
+            supports_none_reasoning_effort=True,
+            supports_tools_with_none_reasoning_effort=True,
+            supports_temperature_with_reasoning_none=True,
+            supports_classic_assistants=False,
+        )
+
+    server_module = importlib.import_module("pingpong.server")
+    monkeypatch.setattr(server_module, "list_class_models", fake_list_class_models)
+
+    async with db.async_session() as session:
+        session.add(
+            models.Class(
+                id=1,
+                name="Chat Class",
+                term="Spring 2026",
+                api_key="sk-test",
+                private=False,
+            )
+        )
+        await session.commit()
+
+    response = api.post(
+        "/api/v1/class/1/assistant",
+        json={
+            "name": "GPT-5.4 Assistant",
+            "instructions": "You are helpful.",
+            "description": "Test assistant",
+            "interaction_mode": "chat",
+            "model": "gpt-5.4",
+            "reasoning_effort": -1,
+            "tools": [],
+            "deleted_private_files": [999],
+        },
+        headers={"Authorization": f"Bearer {valid_user_token}"},
+    )
+    assert response.status_code == 403
+    assert response.json()["detail"] == (
+        "You do not have permission to delete one or more private files."
+    )
+
+
+@with_user(123)
 @with_authz(grants=[("user:123", "can_edit", "assistant:11")])
 async def test_update_assistant_clears_gpt_5_4_temperature_without_reasoning_none(
     api, db, valid_user_token, monkeypatch
@@ -589,6 +641,141 @@ async def test_update_assistant_clears_gpt_5_4_temperature_without_reasoning_non
         updated = await models.Assistant.get_by_id(session, 11)
         assert updated.temperature is None
         assert updated.reasoning_effort == 0
+
+
+@with_user(123)
+@with_authz(grants=[("user:123", "can_edit", "assistant:11")])
+async def test_update_assistant_rejects_unauthorized_deleted_private_files(
+    api, db, valid_user_token, monkeypatch
+):
+    async def fake_list_class_models(class_id: str, request, openai_client):  # type: ignore[no-untyped-def]
+        return _fake_class_models_response(
+            model_id="gpt-5.4",
+            model_name="GPT-5.4",
+            supports_temperature=False,
+            supports_reasoning=True,
+            supports_none_reasoning_effort=True,
+            supports_tools_with_none_reasoning_effort=True,
+            supports_temperature_with_reasoning_none=True,
+            supports_classic_assistants=False,
+        )
+
+    server_module = importlib.import_module("pingpong.server")
+    monkeypatch.setattr(server_module, "list_class_models", fake_list_class_models)
+
+    async with db.async_session() as session:
+        class_ = models.Class(
+            id=1,
+            name="Chat Class",
+            term="Spring 2026",
+            api_key="sk-test",
+            private=False,
+        )
+        assistant = models.Assistant(
+            id=11,
+            name="Assistant",
+            instructions="You are helpful.",
+            description="Assistant description",
+            interaction_mode=schemas.InteractionMode.CHAT,
+            model="gpt-5.4",
+            class_id=class_.id,
+            tools="[]",
+            creator_id=123,
+            published=None,
+            version=3,
+            locked=False,
+        )
+        session.add_all([class_, assistant])
+        await session.commit()
+
+    response = api.put(
+        "/api/v1/class/1/assistant/11",
+        json={
+            "name": "Updated Assistant",
+            "tools": [],
+            "deleted_private_files": [999],
+        },
+        headers={"Authorization": f"Bearer {valid_user_token}"},
+    )
+    assert response.status_code == 403
+    assert response.json()["detail"] == (
+        "You do not have permission to delete one or more private files."
+    )
+
+
+@with_user(123)
+@with_authz(grants=[("user:123", "can_edit", "assistant:11")])
+async def test_update_assistant_allows_deleting_private_class_files(
+    api, db, valid_user_token, monkeypatch
+):
+    async def fake_list_class_models(class_id: str, request, openai_client):  # type: ignore[no-untyped-def]
+        return _fake_class_models_response(
+            model_id="gpt-5.4",
+            model_name="GPT-5.4",
+            supports_temperature=False,
+            supports_reasoning=True,
+            supports_none_reasoning_effort=True,
+            supports_tools_with_none_reasoning_effort=True,
+            supports_temperature_with_reasoning_none=True,
+            supports_classic_assistants=False,
+        )
+
+    server_module = importlib.import_module("pingpong.server")
+    monkeypatch.setattr(server_module, "list_class_models", fake_list_class_models)
+
+    async with db.async_session() as session:
+        uploader = models.User(id=999, email="uploader999@example.com")
+        class_ = models.Class(
+            id=1,
+            name="Chat Class",
+            term="Spring 2026",
+            api_key="sk-test",
+            private=False,
+        )
+        assistant = models.Assistant(
+            id=11,
+            name="Assistant",
+            instructions="You are helpful.",
+            description="Assistant description",
+            interaction_mode=schemas.InteractionMode.CHAT,
+            model="gpt-5.4",
+            class_id=class_.id,
+            tools="[]",
+            creator_id=123,
+            published=None,
+            version=3,
+            locked=False,
+        )
+        session.add_all([uploader, class_, assistant])
+        await session.flush()
+        file = await models.File.create(
+            session,
+            {
+                "name": "Private upload",
+                "content_type": "text/plain",
+                "file_id": "file-123",
+                "private": True,
+                "uploader_id": 999,
+                "class_id": class_.id,
+            },
+            class_.id,
+        )
+        await session.commit()
+
+    response = api.put(
+        "/api/v1/class/1/assistant/11",
+        json={
+            "name": "Updated Assistant",
+            "tools": [],
+            "deleted_private_files": [file.id],
+        },
+        headers={"Authorization": f"Bearer {valid_user_token}"},
+    )
+    assert response.status_code == 200
+
+    async with db.async_session() as session:
+        deleted_file = await models.File.get_by_id(session, file.id)
+        assert deleted_file is None
 
 
 @with_user(123)
