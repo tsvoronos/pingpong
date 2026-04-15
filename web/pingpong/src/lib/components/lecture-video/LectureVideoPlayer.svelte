@@ -31,7 +31,22 @@
 	const VOLUME_SLIDER_PADDING_PX = 5;
 	const VOLUME_SLIDER_TRACK_WIDTH_PX = 54;
 	const VOLUME_SLIDER_EXPANDED_WIDTH_PX = 76;
+	const MARKER_CLUSTER_THRESHOLD_PX = 28;
+	const MARKER_CLUSTER_COLLAPSE_DELAY_MS = 120;
 	const OVERLAY_TEXT_SHADOW = 'text-shadow: rgb(0 0 0) 0 0 2px;';
+
+	type QuestionMarker = {
+		id: number;
+		offsetMs: number;
+		label: string;
+		state: QuestionMarkerState;
+	};
+
+	type MarkerCluster = {
+		key: string;
+		markers: QuestionMarker[];
+		centerPct: number;
+	};
 
 	function markerTickClass(state: QuestionMarkerState): string {
 		switch (state) {
@@ -48,6 +63,17 @@
 		if (!condensedMarkerMode || state !== 'upcoming') return false;
 		if (condensedMarkerIds.length < 2) return false;
 		return markerId === condensedMarkerIds[condensedMarkerIds.length - 1];
+	}
+
+	function markerStateLabel(state: QuestionMarkerState): string {
+		switch (state) {
+			case 'correct':
+				return 'answered correctly';
+			case 'incorrect':
+				return 'answered incorrectly';
+			default:
+				return 'upcoming';
+		}
 	}
 
 	let {
@@ -78,12 +104,7 @@
 		src: string;
 		displayTitle?: string;
 		startOffsetMs?: number;
-		questionMarkers?: {
-			id: number;
-			offsetMs: number;
-			label: string;
-			state: QuestionMarkerState;
-		}[];
+		questionMarkers?: QuestionMarker[];
 		subtitleText?: string | null;
 		disabled?: boolean;
 		manualPlaybackPrompt?: boolean;
@@ -145,6 +166,8 @@
 	let previewVideoDeactivateTimeout: ReturnType<typeof setTimeout> | null = $state(null);
 	let snapshotCanvasElement: HTMLCanvasElement | null = $state(null);
 	let playerContainerElement: HTMLDivElement | null = $state(null);
+	let activeClusterKey: string | null = $state(null);
+	let clusterCollapseTimeout: ReturnType<typeof setTimeout> | null = $state(null);
 
 	let effectiveOffsetMs = $derived(
 		draggingSeek ? (dragPreviewOffsetMs ?? currentTimeMs) : currentTimeMs
@@ -164,6 +187,36 @@
 			? questionMarkers.filter((m) => condensedMarkerIds.includes(m.id))
 			: questionMarkers
 	);
+	let markerNumberById: Map<number, number> = $derived.by(
+		() => new Map(questionMarkers.map((marker, index) => [marker.id, index + 1]))
+	);
+	let markerClusters: MarkerCluster[] = $derived.by(() => {
+		if (durationMs <= 0 || trackWidth <= 0 || visibleMarkers.length === 0) return [];
+		const sorted = [...visibleMarkers].sort((a, b) => a.offsetMs - b.offsetMs);
+		const clusters: MarkerCluster[] = [];
+		for (const marker of sorted) {
+			const pct = clamp((marker.offsetMs / durationMs) * 100, 0, 100);
+			const px = (pct / 100) * trackWidth;
+			const last = clusters[clusters.length - 1];
+			if (last) {
+				const lastMarker = last.markers[last.markers.length - 1];
+				const lastMarkerPct = clamp((lastMarker.offsetMs / durationMs) * 100, 0, 100);
+				const lastMarkerPx = (lastMarkerPct / 100) * trackWidth;
+				if (Math.abs(px - lastMarkerPx) < MARKER_CLUSTER_THRESHOLD_PX) {
+					last.markers.push(marker);
+					const sumPct = last.markers.reduce(
+						(s, m) => s + clamp((m.offsetMs / durationMs) * 100, 0, 100),
+						0
+					);
+					last.centerPct = sumPct / last.markers.length;
+					last.key = last.markers.map((m) => m.id).join('-');
+					continue;
+				}
+			}
+			clusters.push({ key: String(marker.id), markers: [marker], centerPct: pct });
+		}
+		return clusters;
+	});
 	let seekBarActive = $derived(seekPreviewVisible || draggingSeek);
 	let knowledgeChecksVisible = $derived(!manualPlaybackPrompt && !seekBarActive);
 	let previewVideoSrc = $derived(previewVideoActivated ? src : undefined);
@@ -187,6 +240,47 @@
 			: '--:-- / --:--'
 	);
 	let titleText = $derived(displayTitle.trim() || 'Lecture Video');
+
+	function markerDisplayLabel(marker: QuestionMarker): string {
+		const markerNumber = markerNumberById.get(marker.id);
+		return markerNumber ? `${marker.label} ${markerNumber}` : marker.label;
+	}
+
+	function markerAriaLabel(marker: QuestionMarker): string {
+		return `${markerDisplayLabel(marker)} - ${markerStateLabel(marker.state)}`;
+	}
+
+	function clearClusterCollapseTimeout() {
+		if (clusterCollapseTimeout) {
+			clearTimeout(clusterCollapseTimeout);
+			clusterCollapseTimeout = null;
+		}
+	}
+
+	function activateCluster(clusterKey: string) {
+		clearClusterCollapseTimeout();
+		activeClusterKey = clusterKey;
+	}
+
+	function scheduleClusterCollapse(clusterKey: string) {
+		clearClusterCollapseTimeout();
+		clusterCollapseTimeout = setTimeout(() => {
+			if (activeClusterKey === clusterKey) activeClusterKey = null;
+			clusterCollapseTimeout = null;
+		}, MARKER_CLUSTER_COLLAPSE_DELAY_MS);
+	}
+
+	function toggleClusterExpansion(clusterKey: string) {
+		clearClusterCollapseTimeout();
+		activeClusterKey = activeClusterKey === clusterKey ? null : clusterKey;
+	}
+
+	function handleClusterFocusOut(event: FocusEvent, clusterKey: string) {
+		const container = event.currentTarget;
+		if (!(container instanceof HTMLDivElement)) return;
+		if (event.relatedTarget instanceof Node && container.contains(event.relatedTarget)) return;
+		scheduleClusterCollapse(clusterKey);
+	}
 
 	function syncMediaSessionPositionState() {
 		if (typeof navigator === 'undefined' || !('mediaSession' in navigator) || !videoElement) {
@@ -297,6 +391,21 @@
 			condensedMarkerIds = [];
 		}
 	});
+
+	$effect(() => {
+		if (!knowledgeChecksVisible) {
+			clearClusterCollapseTimeout();
+			activeClusterKey = null;
+		}
+	});
+
+	$effect(() => {
+		if (activeClusterKey && !markerClusters.some((cluster) => cluster.key === activeClusterKey)) {
+			activeClusterKey = null;
+		}
+	});
+
+	$effect(() => () => clearClusterCollapseTimeout());
 
 	$effect(() => {
 		if (typeof navigator === 'undefined' || !('mediaSession' in navigator)) {
@@ -1044,59 +1153,151 @@
 						? 1
 						: 0}; transform: translateY({knowledgeChecksVisible ? 0 : 6}px);"
 				>
+					{#snippet diamond(state: QuestionMarkerState)}
+						<div
+							class="relative flex size-3.5 shrink-0 items-center justify-center [filter:drop-shadow(0_1px_1px_rgba(0,0,0,0.3))]"
+						>
+							{#if state === 'correct'}
+								<div
+									class="absolute inset-0 rotate-45 rounded-sm border border-emerald-700 bg-emerald-500"
+								></div>
+								<CheckOutline class="relative z-10 size-2 text-white" />
+							{:else if state === 'incorrect'}
+								<div
+									class="absolute inset-0 rotate-45 rounded-sm border border-rose-700 bg-rose-500"
+								></div>
+								<CloseOutline class="relative z-10 size-2 text-white" />
+							{:else}
+								<div
+									class="absolute inset-0 rotate-45 rounded-sm border border-amber-600 bg-amber-400"
+								></div>
+								<span class="relative z-10 text-[8px] leading-none font-bold text-white">?</span>
+							{/if}
+						</div>
+					{/snippet}
 					{#if durationMs > 0}
-						{#each visibleMarkers as marker (marker.id)}
-							{@const position = clamp((marker.offsetMs / durationMs) * 100, 0, 100)}
-							{@const markerInteractive = knowledgeChecksVisible && marker.state !== 'upcoming'}
+						{#each markerClusters as cluster (cluster.key)}
+							{@const isActive = activeClusterKey === cluster.key}
+							{@const isMulti = cluster.markers.length > 1}
+							{@const clusterInteractive =
+								knowledgeChecksVisible &&
+								cluster.markers.some((marker) => marker.state !== 'upcoming')}
+							{@const fadeDuration = cluster.markers.some((m) => shouldFadeMarker(m.id, m.state))
+								? 300
+								: 0}
 							<div
-								class="absolute bottom-0 -translate-x-1/2 {markerInteractive
+								class="absolute bottom-0 -translate-x-1/2 {clusterInteractive
 									? 'pointer-events-auto'
 									: 'pointer-events-none'}"
-								style="left: {position}%;"
-								in:fade={{ duration: shouldFadeMarker(marker.id, marker.state) ? 300 : 0 }}
+								style="left: {cluster.centerPct}%;"
+								in:fade={{ duration: fadeDuration }}
+								onmouseenter={() => {
+									if (clusterInteractive) activateCluster(cluster.key);
+								}}
+								onmouseleave={() => {
+									if (activeClusterKey === cluster.key) scheduleClusterCollapse(cluster.key);
+								}}
+								onfocusin={() => {
+									if (clusterInteractive) activateCluster(cluster.key);
+								}}
+								onfocusout={(event) => handleClusterFocusOut(event, cluster.key)}
 							>
-								<div
-									class="{markerInteractive
-										? 'pointer-events-auto'
-										: 'pointer-events-none'} rounded-xl bg-black/30 p-1"
-								>
-									<!-- svelte-ignore a11y_click_events_have_key_events -->
-									<!-- svelte-ignore a11y_no_static_element_interactions -->
-									<div
-										class="flex flex-col items-center rounded-lg px-2 py-1.5 transition-colors duration-200 ease-out {marker.state !==
-										'upcoming'
-											? 'cursor-pointer hover:bg-white/10'
-											: ''}"
-										onclick={marker.state !== 'upcoming'
-											? (e) => {
-													e.stopPropagation();
-													onquestionclick?.(marker.id);
-												}
-											: undefined}
-									>
-										<span
-											class="text-[10px] leading-tight font-medium text-white"
-											style={OVERLAY_TEXT_SHADOW}>Comprehension</span
-										>
-										<span
-											class="text-[10px] leading-tight font-medium text-white"
-											style={OVERLAY_TEXT_SHADOW}>Check</span
-										>
-										<div class="relative mt-2 flex size-3.5 items-center justify-center">
-											{#if marker.state === 'correct'}
-												<div class="absolute inset-0 rotate-45 rounded-sm bg-emerald-500"></div>
-												<CheckOutline class="relative z-10 size-2 text-white" />
-											{:else if marker.state === 'incorrect'}
-												<div class="absolute inset-0 rotate-45 rounded-sm bg-rose-500"></div>
-												<CloseOutline class="relative z-10 size-2 text-white" />
-											{:else}
-												<div class="absolute inset-0 rotate-45 rounded-sm bg-amber-400"></div>
-												<span class="relative z-10 text-[8px] leading-none font-bold text-white"
-													>?</span
+								<div class="rounded-xl bg-black/30 p-1">
+									{#if isMulti}
+										{#key `${cluster.key}-${isActive ? 'expanded' : 'compact'}`}
+											{#if !isActive}
+												<button
+													type="button"
+													class="flex items-center rounded-lg px-1.5 py-1 transition-colors duration-150 ease-out disabled:cursor-default {clusterInteractive
+														? 'cursor-pointer hover:bg-white/10 focus-visible:bg-white/10'
+														: ''}"
+													aria-label={`Show ${cluster.markers.length} comprehension checks`}
+													aria-expanded={clusterInteractive ? isActive : undefined}
+													disabled={!clusterInteractive}
+													onclick={(e) => {
+														e.stopPropagation();
+														if (clusterInteractive) toggleClusterExpansion(cluster.key);
+													}}
 												>
+													{#each cluster.markers as marker, idx (marker.id)}
+														<div class="relative {idx > 0 ? '-ml-1.5' : ''}">
+															{@render diamond(marker.state)}
+														</div>
+													{/each}
+													<span
+														class="ml-1.5 text-[10px] leading-none font-semibold text-white tabular-nums"
+														style={OVERLAY_TEXT_SHADOW}
+													>
+														×{cluster.markers.length}
+													</span>
+												</button>
+											{:else}
+												<div
+													class="flex flex-col gap-0.5 rounded-lg pb-0.5"
+													transition:fade={{ duration: 100 }}
+												>
+													{#each cluster.markers as marker (marker.id)}
+														{@const itemInteractive =
+															knowledgeChecksVisible && marker.state !== 'upcoming'}
+														<button
+															type="button"
+															class="flex items-center gap-1.5 rounded px-1.5 py-1 text-left transition-colors duration-150 ease-out disabled:cursor-default {itemInteractive
+																? 'cursor-pointer hover:bg-white/10 focus-visible:bg-white/10'
+																: ''}"
+															aria-label={markerAriaLabel(marker)}
+															disabled={!itemInteractive}
+															onclick={(e) => {
+																e.stopPropagation();
+																activeClusterKey = null;
+																onquestionclick?.(marker.id);
+															}}
+														>
+															{@render diamond(marker.state)}
+															<span
+																class="text-[10px] leading-tight font-medium whitespace-nowrap text-white"
+																style={OVERLAY_TEXT_SHADOW}
+															>
+																{markerDisplayLabel(marker)}
+															</span>
+														</button>
+													{/each}
+												</div>
 											{/if}
+										{/key}
+									{:else}
+										{@const marker = cluster.markers[0]}
+										{@const markerInteractive =
+											knowledgeChecksVisible && marker.state !== 'upcoming'}
+										<div class="relative">
+											<div
+												class="pointer-events-none absolute bottom-full left-1/2 mb-2 transition-all duration-150 ease-out"
+												style="transform: translateX(-50%) translateY({isActive
+													? '0px'
+													: '4px'}); opacity: {isActive ? 1 : 0};"
+											>
+												<div
+													class="rounded-md bg-slate-900/95 px-2 py-1 text-[10px] font-medium tracking-wide whitespace-nowrap text-white shadow-lg ring-1 ring-white/10"
+												>
+													{markerDisplayLabel(marker)}
+												</div>
+											</div>
+											<button
+												type="button"
+												class="flex items-center justify-center rounded-lg px-1.5 py-1 transition-colors duration-200 ease-out disabled:cursor-default {markerInteractive
+													? 'cursor-pointer hover:bg-white/10 focus-visible:bg-white/10'
+													: ''}"
+												aria-label={markerAriaLabel(marker)}
+												disabled={!markerInteractive}
+												onclick={(e) => {
+													e.stopPropagation();
+													activeClusterKey = null;
+													onquestionclick?.(marker.id);
+												}}
+											>
+												{@render diamond(marker.state)}
+											</button>
 										</div>
-									</div>
+									{/if}
 								</div>
 							</div>
 						{/each}
