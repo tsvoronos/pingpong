@@ -151,10 +151,12 @@
 		expandedThreadData.data?.thread?.is_current_user_participant === true;
 	$: lectureVideoSession = expandedThreadData.data?.lecture_video_session ?? null;
 	$: threadLectureChatAvailable = lectureVideoSession?.lecture_video_chat_available === true;
+	$: lectureVideoTtsAvailable = expandedThreadData.data?.lecture_video_tts_available === true;
 	$: effectiveLectureVideoMismatch = threadLectureVideoMismatch;
 	$: effectiveLectureVideoAssistantMismatch = threadLectureVideoMismatch;
 	let lectureVideoViewRef: LectureVideoViewHandle | null = null;
 	let lectureChatHasDraft = false;
+	let lecturePlayerVolume = 1;
 	let liveLectureVideoSession: api.LectureVideoSession | null = null;
 	let lectureVideoSessionKey: string | null = null;
 	$: {
@@ -235,7 +237,12 @@
 				: undefined;
 	}
 	$: submitting = threadMgr.submitting;
+	$: ttsMuted = threadMgr.ttsMuted;
 	$: waiting = threadMgr.waiting;
+	$: ttsPlaying = threadMgr.ttsPlaying;
+	$: if (data.threadInteractionMode === 'lecture_video') {
+		threadMgr.setTtsVolume(lecturePlayerVolume);
+	}
 	$: loading = threadMgr.loading;
 	$: canFetchMore = threadMgr.canFetchMore;
 	$: supportsFileSearch = data.availableTools.includes('file_search') || false;
@@ -704,6 +711,10 @@
 
 	const handleLectureSessionChange = (e: CustomEvent<api.LectureVideoSession>) => {
 		liveLectureVideoSession = e.detail;
+	};
+
+	const handleLecturePlaybackResumed = () => {
+		threadMgr.interruptTts().catch(() => {});
 	};
 
 	const handleLectureChatDraftChange = ({ hasText }: { hasText: boolean }) => {
@@ -1422,6 +1433,8 @@
 	});
 
 	beforeNavigate((nav) => {
+		// Stop any active TTS audio on navigation
+		threadMgr.interruptTts().catch(() => {});
 		if (
 			(data.isSharedAssistantPage || data.isSharedThreadPage) &&
 			isAnonymousSession &&
@@ -1482,9 +1495,11 @@
 					title={lectureVideoDisplayTitle}
 					canParticipate={threadIsCurrentUserParticipant}
 					initialSession={lectureVideoSession}
+					bind:playerVolume={lecturePlayerVolume}
 					deferAutoContinueForChatDraft={lectureChatHasDraft}
 					chatAvailable={threadLectureChatAvailable}
 					on:sessionchange={handleLectureSessionChange}
+					on:playbackresumed={handleLecturePlaybackResumed}
 				>
 					{#snippet chat()}
 						{#if threadLectureChatAvailable}
@@ -1498,6 +1513,9 @@
 								disabled={lectureChatInputDisabled}
 								waiting={$waiting}
 								submitting={$submitting}
+								ttsMuted={$ttsMuted}
+								ttsPlaying={$ttsPlaying}
+								ttsAvailable={lectureVideoTtsAvailable}
 								{threadManagerError}
 								{assistantDeleted}
 								{canViewAssistant}
@@ -1515,6 +1533,9 @@
 								ondismisserror={handleLectureChatDismissError}
 								ontextinput={handleLectureChatDraftChange}
 								ontextpaste={handleLectureChatDraftChange}
+								onmutettstoggle={() => {
+									threadMgr.setTtsMuted(!$ttsMuted);
+								}}
 							/>
 						{/if}
 					{/snippet}

@@ -1354,6 +1354,7 @@ class NewThreadMessage(BaseModel):
     vision_file_ids: list[str] = Field([])
     vision_image_descriptions: list[ImageProxy] = Field([])
     timezone: str | None = None
+    generate_speech: bool | None = None
 
     _file_check = model_validator(mode="after")(file_validator)
 
@@ -2601,6 +2602,7 @@ class ThreadWithMeta(BaseModel):
     lecture_video_id: int | None = None
     lecture_video_matches_assistant: bool | None = None
     lecture_video_session: LectureVideoSession | None = None
+    lecture_video_tts_available: bool = False
     recording: VoiceModeRecording | None = None
     has_more: bool
 

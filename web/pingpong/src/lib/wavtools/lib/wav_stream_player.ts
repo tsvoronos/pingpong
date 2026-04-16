@@ -36,9 +36,11 @@ export type OnAudioPartStartedProcessor = (data: {
 	eventId: string;
 	timestamp: number;
 }) => void;
+export type OnPlaybackStoppedProcessor = () => void;
 interface WavStreamPlayerOptions {
 	sampleRate?: number;
 	onAudioPartStarted?: OnAudioPartStartedProcessor;
+	onPlaybackStopped?: OnPlaybackStoppedProcessor;
 }
 
 interface TrackSampleOffset {
@@ -46,6 +48,8 @@ interface TrackSampleOffset {
 	offset: number;
 	currentTime: number;
 }
+
+const TRACK_SAMPLE_OFFSET_TIMEOUT_MS = 250;
 
 /**
  * Plays audio streams received in raw PCM16 chunks from the browser
@@ -57,24 +61,32 @@ export class WavStreamPlayer {
 	private context: AudioContext | null;
 	private stream: AudioWorkletNode | null;
 	private analyser: AnalyserNode | null;
+	private gainNode: GainNode | null;
 	private trackSampleOffsets: Record<string, TrackSampleOffset>;
 	private interruptedTrackIds: Record<string, boolean>;
 	private onAudioPartStarted: OnAudioPartStartedProcessor | null;
+	private onPlaybackStopped: OnPlaybackStoppedProcessor | null;
 
 	/**
 	 * Creates a new WavStreamPlayer instance
 	 * @param {{sampleRate?: number, onAudioPartStarted?: OnAudioPartStartedProcessor}} options
 	 * @returns {WavStreamPlayer}
 	 */
-	constructor({ sampleRate = 44100, onAudioPartStarted }: WavStreamPlayerOptions = {}) {
+	constructor({
+		sampleRate = 44100,
+		onAudioPartStarted,
+		onPlaybackStopped
+	}: WavStreamPlayerOptions = {}) {
 		this.scriptSrc = StreamProcessorSrc;
 		this.sampleRate = sampleRate;
 		this.context = null;
 		this.stream = null;
 		this.analyser = null;
+		this.gainNode = null;
 		this.trackSampleOffsets = {};
 		this.interruptedTrackIds = {};
 		this.onAudioPartStarted = onAudioPartStarted || null;
+		this.onPlaybackStopped = onPlaybackStopped || null;
 	}
 
 	/**
@@ -99,6 +111,9 @@ export class WavStreamPlayer {
 		analyser.fftSize = 8192;
 		analyser.smoothingTimeConstant = 0.1;
 		this.analyser = analyser;
+		const gainNode = this.context.createGain();
+		gainNode.connect(this.context.destination);
+		this.gainNode = gainNode;
 		return true;
 	}
 
@@ -139,6 +154,16 @@ export class WavStreamPlayer {
 	}
 
 	/**
+	 * Sets the output volume (0.0 = muted, 1.0 = full volume)
+	 * @param {number} volume
+	 */
+	setVolume(volume: number): void {
+		if (this.gainNode) {
+			this.gainNode.gain.value = Math.max(0, Math.min(1, volume));
+		}
+	}
+
+	/**
 	 * Starts audio streaming
 	 * @private
 	 * @returns {true}
@@ -148,12 +173,13 @@ export class WavStreamPlayer {
 			throw new Error('Not connected, please call .connect() first');
 		}
 		const streamNode = new AudioWorkletNode(this.context, 'stream_processor');
-		streamNode.connect(this.context.destination);
+		streamNode.connect(this.gainNode || this.context.destination);
 		streamNode.port.onmessage = (e) => {
 			const { event } = e.data;
 			if (event === 'stop') {
 				streamNode.disconnect();
 				this.stream = null;
+				this.onPlaybackStopped?.();
 			} else if (event === 'offset') {
 				const { requestId, trackId, offset } = e.data;
 				const currentTime = offset / this.sampleRate;
@@ -212,19 +238,31 @@ export class WavStreamPlayer {
 	 * @returns {{trackId: string|null, offset: number, currentTime: number}}
 	 */
 	async getTrackSampleOffset(interrupt = false): Promise<TrackSampleOffset | null> {
-		if (!this.stream) {
+		const stream = this.stream;
+		if (!stream) {
 			return null;
 		}
 		const requestId = crypto.randomUUID();
-		this.stream.port.postMessage({
+		stream.port.postMessage({
 			event: interrupt ? 'interrupt' : 'offset',
 			requestId
 		});
+		const timeoutAt = Date.now() + TRACK_SAMPLE_OFFSET_TIMEOUT_MS;
 		let trackSampleOffset: TrackSampleOffset | null = null;
 		while (!trackSampleOffset) {
 			trackSampleOffset = this.trackSampleOffsets[requestId];
+			if (trackSampleOffset) {
+				break;
+			}
+			if (this.stream !== stream) {
+				return null;
+			}
+			if (Date.now() >= timeoutAt) {
+				return null;
+			}
 			await new Promise<void>((r) => setTimeout(() => r(), 1));
 		}
+		delete this.trackSampleOffsets[requestId];
 		const { trackId } = trackSampleOffset;
 		if (interrupt && trackId) {
 			this.interruptedTrackIds[trackId] = true;
@@ -239,5 +277,30 @@ export class WavStreamPlayer {
 	 */
 	async interrupt(): Promise<TrackSampleOffset | null> {
 		return this.getTrackSampleOffset(true);
+	}
+
+	/**
+	 * Fully tear down the audio graph and release the AudioContext.
+	 */
+	async close(): Promise<void> {
+		if (this.stream) {
+			this.stream.disconnect();
+			this.stream = null;
+		}
+		if (this.analyser) {
+			this.analyser.disconnect();
+			this.analyser = null;
+		}
+		if (this.gainNode) {
+			this.gainNode.disconnect();
+			this.gainNode = null;
+		}
+		this.trackSampleOffsets = {};
+		this.interruptedTrackIds = {};
+		if (this.context) {
+			const context = this.context;
+			this.context = null;
+			await context.close();
+		}
 	}
 }

@@ -316,6 +316,30 @@ def _lecture_video_matches_assistant(
     )
 
 
+async def _lecture_video_tts_available(
+    db: Any,
+    thread: models.Thread,
+) -> bool:
+    if (
+        thread.interaction_mode != schemas.InteractionMode.LECTURE_VIDEO
+        or thread.lecture_video_id is None
+    ):
+        return False
+
+    lecture_video = await models.LectureVideo.get_by_id(db, thread.lecture_video_id)
+    if lecture_video is None or not (lecture_video.voice_id or "").strip():
+        return False
+
+    credential = await models.ClassCredential.get_by_class_id_and_purpose(
+        db,
+        int(thread.class_id),
+        schemas.ClassCredentialPurpose.LECTURE_VIDEO_NARRATION_TTS,
+    )
+    return bool(
+        credential and credential.api_key_obj and credential.api_key_obj.api_key
+    )
+
+
 def _raise_lecture_video_runtime_http_error(
     err: lecture_video_runtime.LectureVideoRuntimeError,
 ) -> NoReturn:
@@ -3745,10 +3769,14 @@ async def get_thread(
         lecture_video_matches_assistant = _lecture_video_matches_assistant(
             thread, assistant
         )
+        lecture_video_tts_available = False
         lecture_video_session = None
         if thread.interaction_mode == schemas.InteractionMode.LECTURE_VIDEO:
             lecture_video_can_participate = await can_participate_thread(request)
             thread.is_current_user_participant = lecture_video_can_participate
+            lecture_video_tts_available = await _lecture_video_tts_available(
+                request.state["db"], thread
+            )
             lecture_video_session = await lecture_video_runtime.get_thread_session(
                 request.state["db"],
                 thread.id,
@@ -3779,6 +3807,7 @@ async def get_thread(
             "instructions": thread.instructions if can_view_prompt else None,
             "lecture_video_matches_assistant": lecture_video_matches_assistant,
             "lecture_video_session": lecture_video_session,
+            "lecture_video_tts_available": lecture_video_tts_available,
             "recording": thread.voice_mode_recording
             if is_supervisor or is_current_user
             else None,
@@ -4353,10 +4382,14 @@ async def get_thread(
         lecture_video_matches_assistant = _lecture_video_matches_assistant(
             thread, assistant
         )
+        lecture_video_tts_available = False
         lecture_video_session = None
         if thread.interaction_mode == schemas.InteractionMode.LECTURE_VIDEO:
             lecture_video_can_participate = await can_participate_thread(request)
             thread.is_current_user_participant = lecture_video_can_participate
+            lecture_video_tts_available = await _lecture_video_tts_available(
+                request.state["db"], thread
+            )
             lecture_video_session = await lecture_video_runtime.get_thread_session(
                 request.state["db"],
                 thread.id,
@@ -4415,6 +4448,7 @@ async def get_thread(
             "lecture_video_id": thread.lecture_video_id,
             "lecture_video_matches_assistant": lecture_video_matches_assistant,
             "lecture_video_session": lecture_video_session,
+            "lecture_video_tts_available": lecture_video_tts_available,
             "recording": thread.voice_mode_recording
             if is_supervisor or is_current_user
             else None,
@@ -7861,6 +7895,30 @@ async def send_message(
                     prev_output_sequence=prev_output_sequence,
                 )
 
+            # Resolve TTS credentials for lecture-video chat audio streaming.
+            # Skip entirely when the client explicitly opted out of speech.
+            tts_voice_id: str | None = None
+            tts_api_key: str | None = None
+            if (
+                data.generate_speech is not False
+                and thread.interaction_mode == schemas.InteractionMode.LECTURE_VIDEO
+                and thread.lecture_video_id
+            ):
+                lecture_video = await models.LectureVideo.get_by_id(
+                    request.state["db"], thread.lecture_video_id
+                )
+                if lecture_video and (lecture_video.voice_id or "").strip():
+                    credential = (
+                        await models.ClassCredential.get_by_class_id_and_purpose(
+                            request.state["db"],
+                            int(class_id),
+                            schemas.ClassCredentialPurpose.LECTURE_VIDEO_NARRATION_TTS,
+                        )
+                    )
+                    if credential and credential.api_key_obj:
+                        tts_voice_id = lecture_video.voice_id.strip()
+                        tts_api_key = credential.api_key_obj.api_key
+
             show_reasoning_summaries = is_supervisor or (
                 asst and not asst.hide_reasoning_summaries
             )
@@ -7986,6 +8044,8 @@ async def send_message(
                 anonymous_session_id=request.state["anonymous_session_id"],
                 anonymous_link_id=request.state["anonymous_link_id"],
                 response_safety_identifier=request.state["response_safety_identifier"],
+                tts_voice_id=tts_voice_id,
+                tts_api_key=tts_api_key,
             )
         else:
             raise HTTPException(

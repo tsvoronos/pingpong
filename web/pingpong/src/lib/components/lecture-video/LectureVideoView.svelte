@@ -44,6 +44,7 @@
 		initialSession = null,
 		deferAutoContinueForChatDraft = false,
 		chatAvailable = false,
+		playerVolume = $bindable(1),
 		chat = undefined
 	}: {
 		classId: number;
@@ -54,10 +55,12 @@
 		initialSession?: LectureVideoSession | null;
 		deferAutoContinueForChatDraft?: boolean;
 		chatAvailable?: boolean;
+		playerVolume?: number;
 		chat?: Snippet;
 	} = $props();
 	const dispatch = createEventDispatcher<{
 		sessionchange: LectureVideoSession;
+		playbackresumed: void;
 	}>();
 
 	// --- Session state ---
@@ -82,7 +85,6 @@
 	let videoElement: HTMLVideoElement | null = $state(null);
 	let currentTimeMs: number = $state(0);
 	let paused: boolean = $state(true);
-	let playerVolume: number = $state(1);
 	let subtitleText: string | null = $state(null);
 	let playerDisabled: boolean = $state(false);
 	let questionPlaybackLocked: boolean = $state(false);
@@ -991,6 +993,7 @@
 
 	function handlePlay() {
 		clearPendingVideoRetry();
+		dispatch('playbackresumed');
 		if (!videoElement) return;
 		if (playbackLocked) {
 			suppressPauseInteraction = true;
