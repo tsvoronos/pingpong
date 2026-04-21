@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+from typing import ClassVar
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
@@ -28,7 +29,7 @@ class _StubConnector(OAuth2Connector):
     slug = "stub"
     display_name = "Stub"
     requires_tenant = False
-    scopes = ["openid", "api"]
+    scopes: ClassVar[list[str]] = ["openid", "api"]
 
     def __init__(self, *, revoke_url: str | None = None, nowfn=fixed_now):
         super().__init__(nowfn=nowfn)

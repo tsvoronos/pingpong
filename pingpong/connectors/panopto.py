@@ -48,6 +48,11 @@ class PanoptoConnector(OAuth2Connector):
         return t.client_id, t.client_secret
 
     def tenant_friendly_name(self, tenant: str | None) -> str | None:
+        # Intentionally returns None for unknown/unconfigured tenants rather
+        # than raising ConnectorNotConfigured (unlike tenant_host and
+        # client_credentials which go through _tenant()).  This method is used
+        # for UI display; returning None lets the caller fall back gracefully
+        # instead of surfacing a 500 to the user.
         if tenant is None:
             return None
         resolved = config.connectors.panopto.tenant(tenant)

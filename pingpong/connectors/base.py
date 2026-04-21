@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import logging
 import secrets
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -10,6 +11,8 @@ from urllib.parse import urlencode
 
 import httpx
 from sqlalchemy.ext.asyncio import AsyncSession
+
+logger = logging.getLogger(__name__)
 
 from pingpong.now import NowFn, utcnow
 
@@ -190,11 +193,24 @@ class OAuth2Connector:
             data["token_type_hint"] = "access_token"
         try:
             async with httpx.AsyncClient() as client:
-                await client.post(url, data=data)
-        except httpx.HTTPError:
+                response = await client.post(url, data=data)
+            if response.is_error:
+                logger.warning(
+                    "Connector revoke returned %s for connector id=%s (service=%s): %s",
+                    response.status_code,
+                    connector.id,
+                    self.slug,
+                    response.text[:200],
+                )
+        except httpx.HTTPError as exc:
             # Best-effort revoke: the caller always deletes the row, and a
             # failed revoke should not block that.
-            pass
+            logger.warning(
+                "Connector revoke request failed for connector id=%s (service=%s): %s",
+                connector.id,
+                self.slug,
+                exc,
+            )
 
     # ---- transparent access token ---------------------------------------
 

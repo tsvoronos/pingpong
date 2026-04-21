@@ -50,17 +50,35 @@ def upgrade() -> None:
         # valid on the provider side.
         sa.ForeignKeyConstraint(["user_id"], ["users.id"]),
         sa.PrimaryKeyConstraint("id"),
-        sa.UniqueConstraint(
-            "user_id", "service", "tenant", name="uq_user_service_tenant"
-        ),
     )
     op.create_index(
         "idx_user_connectors_user_id",
         "user_connectors",
         ["user_id"],
     )
+    # Two partial indexes instead of a plain UniqueConstraint so that
+    # NULL-tenant connectors are correctly deduplicated.  PostgreSQL treats
+    # each NULL as distinct in a standard unique index, so a plain
+    # UniqueConstraint("user_id", "service", "tenant") would allow duplicate
+    # (user_id, service, NULL) rows.
+    op.create_index(
+        "uq_user_service_no_tenant",
+        "user_connectors",
+        ["user_id", "service"],
+        unique=True,
+        postgresql_where=sa.text("tenant IS NULL"),
+    )
+    op.create_index(
+        "uq_user_service_tenant",
+        "user_connectors",
+        ["user_id", "service", "tenant"],
+        unique=True,
+        postgresql_where=sa.text("tenant IS NOT NULL"),
+    )
 
 
 def downgrade() -> None:
+    op.drop_index("uq_user_service_tenant", table_name="user_connectors")
+    op.drop_index("uq_user_service_no_tenant", table_name="user_connectors")
     op.drop_index("idx_user_connectors_user_id", table_name="user_connectors")
     op.drop_table("user_connectors")

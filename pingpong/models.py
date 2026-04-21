@@ -1293,8 +1293,24 @@ class UserConnector(Base):
     # path, leaving upstream tokens valid on the provider side. The user
     # deletion flow must iterate user.connectors, call revoke(), then delete.
     __table_args__ = (
-        UniqueConstraint(
-            "user_id", "service", "tenant", name="uq_user_service_tenant"
+        # Two partial indexes instead of a plain UniqueConstraint so that
+        # NULL-tenant connectors are correctly deduplicated.  PostgreSQL treats
+        # each NULL as distinct in a standard unique index, so a plain
+        # UniqueConstraint would allow duplicate (user_id, service, NULL) rows.
+        Index(
+            "uq_user_service_no_tenant",
+            "user_id",
+            "service",
+            unique=True,
+            postgresql_where=text("tenant IS NULL"),
+        ),
+        Index(
+            "uq_user_service_tenant",
+            "user_id",
+            "service",
+            "tenant",
+            unique=True,
+            postgresql_where=text("tenant IS NOT NULL"),
         ),
         Index("idx_user_connectors_user_id", "user_id"),
     )
