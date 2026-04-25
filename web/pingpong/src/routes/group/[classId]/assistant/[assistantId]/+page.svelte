@@ -78,7 +78,9 @@
 	import { SvelteSet } from 'svelte/reactivity';
 	export let data;
 	const LECTURE_VIDEO_DEFAULT_INSTRUCTIONS = 'You are a lecture video assistant.';
-	const SUPPORTED_LECTURE_VIDEO_QUESTION_TYPES = new Set(['single_select']);
+	const SUPPORTED_LECTURE_VIDEO_QUESTION_TYPES = new Set<api.LectureVideoQuestionType>([
+		'single_select'
+	]);
 	const DEFAULT_LECTURE_VIDEO_MANIFEST = {
 		version: 1,
 		questions: [
@@ -123,7 +125,19 @@
 	type LectureVideoManifestInput = {
 		version?: number;
 		questions: LectureVideoQuestionInput[];
-		word_level_transcription?: { id: string; word: string; start: number; end: number }[];
+		word_level_transcription?: {
+			id: string;
+			word: string;
+			start?: number;
+			end?: number;
+			start_offset_ms?: number;
+			end_offset_ms?: number;
+		}[];
+		video_descriptions?: {
+			start_offset_ms: number;
+			end_offset_ms: number;
+			description: string;
+		}[];
 	};
 
 	// Flag indicating whether we should check for changes before navigating away.
@@ -288,7 +302,7 @@
 		if (candidate.version === 1) {
 			return true;
 		}
-		if (candidate.version === 2) {
+		if (candidate.version === 2 || candidate.version === 3) {
 			return !hasWordLevelTranscription;
 		}
 		if (candidate.word_level_transcription !== undefined) {
@@ -297,6 +311,14 @@
 
 		return null;
 	};
+
+	const isValidLectureVideoInterval = (start: unknown, end: unknown) =>
+		typeof start === 'number' &&
+		Number.isFinite(start) &&
+		start >= 0 &&
+		typeof end === 'number' &&
+		Number.isFinite(end) &&
+		end >= start;
 
 	// Keep this client-side validation aligned with pingpong/schemas.py:
 	// LectureVideoManifestV1, LectureVideoManifestQuestionV1, and LectureVideoManifestOptionV1.
@@ -315,10 +337,15 @@
 		}
 
 		const candidate = parsed as Partial<LectureVideoManifestInput>;
-		if (candidate.version !== undefined && candidate.version !== 1 && candidate.version !== 2) {
+		if (
+			candidate.version !== undefined &&
+			candidate.version !== 1 &&
+			candidate.version !== 2 &&
+			candidate.version !== 3
+		) {
 			return {
 				manifest: null,
-				error: 'Lecture video manifest version must be 1 or 2.'
+				error: 'Lecture video manifest version must be 1, 2, or 3.'
 			};
 		}
 		if (!Array.isArray(candidate.questions) || candidate.questions.length < 1) {
@@ -335,7 +362,7 @@
 			}
 			if (
 				typeof question.type !== 'string' ||
-				!SUPPORTED_LECTURE_VIDEO_QUESTION_TYPES.has(question.type)
+				!SUPPORTED_LECTURE_VIDEO_QUESTION_TYPES.has(question.type as api.LectureVideoQuestionType)
 			) {
 				return {
 					manifest: null,
@@ -402,8 +429,106 @@
 			}
 		}
 
+		const questions = candidate.questions.map((question) => ({
+			type: question.type as api.LectureVideoQuestionType,
+			question_text: question.question_text,
+			intro_text: question.intro_text,
+			stop_offset_ms: question.stop_offset_ms,
+			options: question.options.map((option) => ({
+				option_text: option.option_text,
+				post_answer_text: option.post_answer_text,
+				continue_offset_ms: option.continue_offset_ms,
+				correct: option.correct
+			}))
+		})) satisfies api.LectureVideoManifestQuestion[];
+
 		const hasWordLevelTranscription = candidate.word_level_transcription !== undefined;
+		const hasV3TranscriptShape =
+			Array.isArray(candidate.word_level_transcription) &&
+			candidate.word_level_transcription.some(
+				(word) =>
+					word && typeof word === 'object' && 'start_offset_ms' in word && 'end_offset_ms' in word
+			);
+		const shouldUseV3Manifest =
+			candidate.version === 3 ||
+			(candidate.version === undefined &&
+				(candidate.video_descriptions !== undefined || hasV3TranscriptShape));
 		const shouldUseV2Manifest = candidate.version === 2 || hasWordLevelTranscription;
+
+		if (shouldUseV3Manifest) {
+			if (
+				!Array.isArray(candidate.word_level_transcription) ||
+				candidate.word_level_transcription.length < 1
+			) {
+				return {
+					manifest: null,
+					error: 'Lecture video manifest version 3 must include non-empty word_level_transcription.'
+				};
+			}
+			if (!Array.isArray(candidate.video_descriptions) || candidate.video_descriptions.length < 1) {
+				return {
+					manifest: null,
+					error: 'Lecture video manifest version 3 must include non-empty video_descriptions.'
+				};
+			}
+
+			for (let index = 0; index < candidate.word_level_transcription.length; index += 1) {
+				const word = candidate.word_level_transcription[index];
+				if (
+					!word ||
+					typeof word !== 'object' ||
+					typeof word.id !== 'string' ||
+					word.id.length < 1 ||
+					typeof word.word !== 'string' ||
+					word.word.length < 1 ||
+					!isValidLectureVideoInterval(word.start_offset_ms, word.end_offset_ms)
+				) {
+					return {
+						manifest: null,
+						error: `word_level_transcription entry ${index + 1} is invalid.`
+					};
+				}
+			}
+
+			for (let index = 0; index < candidate.video_descriptions.length; index += 1) {
+				const description = candidate.video_descriptions[index];
+				if (
+					!description ||
+					typeof description !== 'object' ||
+					typeof description.description !== 'string' ||
+					description.description.length < 1 ||
+					!isValidLectureVideoInterval(description.start_offset_ms, description.end_offset_ms)
+				) {
+					return {
+						manifest: null,
+						error: `video_descriptions entry ${index + 1} is invalid.`
+					};
+				}
+			}
+
+			const wordLevelTranscription = candidate.word_level_transcription.map((word) => ({
+				id: word.id,
+				word: word.word,
+				start_offset_ms: word.start_offset_ms as number,
+				end_offset_ms: word.end_offset_ms as number
+			})) satisfies api.LectureVideoManifestWordV3[];
+			const videoDescriptions = candidate.video_descriptions.map((description) => ({
+				start_offset_ms: description.start_offset_ms,
+				end_offset_ms: description.end_offset_ms,
+				description: description.description
+			})) satisfies api.LectureVideoManifestVideoDescriptionV3[];
+			const manifest = {
+				version: 3,
+				questions,
+				word_level_transcription: wordLevelTranscription,
+				video_descriptions: videoDescriptions
+			} satisfies api.LectureVideoManifestV3;
+
+			return {
+				manifest,
+				error: null
+			};
+		}
 
 		if (shouldUseV2Manifest) {
 			if (
@@ -425,13 +550,7 @@
 					word.id.length < 1 ||
 					typeof word.word !== 'string' ||
 					word.word.length < 1 ||
-					typeof word.start !== 'number' ||
-					!Number.isFinite(word.start) ||
-					word.start < 0 ||
-					typeof word.end !== 'number' ||
-					!Number.isFinite(word.end) ||
-					word.end < 0 ||
-					word.end < word.start
+					!isValidLectureVideoInterval(word.start, word.end)
 				) {
 					return {
 						manifest: null,
@@ -2537,7 +2656,7 @@
 				>
 				{#if lectureVideoChatUnavailable}
 					<Helper class="pb-2 text-amber-700">
-						Lecture chat is only available for lecture videos with a version 2 manifest that
+						Lecture chat is only available for lecture videos with a version 2 or 3 manifest that
 						includes word-level transcription.
 					</Helper>
 				{/if}
