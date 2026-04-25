@@ -114,6 +114,14 @@
 	let suppressPauseInteraction = false;
 	let suppressPlayInteraction = false;
 	let ignorePauseEventUntilMs = 0;
+	let playbackInteractionInFlight = false;
+	let playbackSessionRefreshController: AbortController | null = null;
+	// Playback pause/resume is latest-state telemetry, not a lossless event log.
+	// While a sync is in flight, keep only the newest desired browser playback state.
+	let latestPlaybackInteraction: {
+		type: 'video_paused' | 'video_resumed';
+		offsetMs: number;
+	} | null = null;
 
 	// --- Lease renewal ---
 	let leaseInterval: ReturnType<typeof setInterval> | null = null;
@@ -390,6 +398,10 @@
 		suppressPauseInteraction = false;
 		suppressPlayInteraction = false;
 		ignorePauseEventUntilMs = 0;
+		playbackInteractionInFlight = false;
+		playbackSessionRefreshController?.abort();
+		playbackSessionRefreshController = null;
+		latestPlaybackInteraction = null;
 		revokeNarrationResources();
 		clearPendingVideoRetry();
 		autoContinueInFlight = false;
@@ -434,6 +446,9 @@
 		resumeOffsetOnCanPlay = null;
 		stopNarrationPlayback();
 		autoContinueInFlight = false;
+		playbackSessionRefreshController?.abort();
+		playbackSessionRefreshController = null;
+		latestPlaybackInteraction = null;
 
 		if (videoElement && !videoElement.paused) {
 			suppressPauseInteraction = true;
@@ -457,45 +472,134 @@
 		return true;
 	}
 
-	async function postPlaybackInteraction(type: 'video_paused' | 'video_resumed') {
-		const interactionControllerSessionId = controllerSessionId;
-		if (!interactionControllerSessionId || sessionState !== 'playing') {
-			return;
-		}
-
-		const expectedStateVersion = stateVersion;
-		const offsetMs = Math.round(currentTimeMs);
-
+	async function refreshLectureVideoSession(
+		controllerSessionIdForRequest: string
+	): Promise<boolean> {
+		playbackSessionRefreshController?.abort();
+		const refreshController = new AbortController();
+		playbackSessionRefreshController = refreshController;
 		try {
-			const response = await api.postLectureVideoInteraction(fetch, classId, threadId, {
-				type,
-				controller_session_id: interactionControllerSessionId,
-				expected_state_version: expectedStateVersion,
-				idempotency_key: crypto.randomUUID(),
-				offset_ms: offsetMs
-			});
-			if (controllerSessionId !== interactionControllerSessionId) {
-				return;
+			const response = await api.getThread(
+				fetch,
+				classId,
+				threadId,
+				controllerSessionIdForRequest,
+				refreshController.signal
+			);
+			if (
+				refreshController.signal.aborted ||
+				controllerSessionId !== controllerSessionIdForRequest
+			) {
+				return false;
 			}
 
 			const expanded = api.expandResponse(response);
-			if (failClosedOnConflict(`${type}-conflict`, expanded)) {
-				return;
-			}
 			if (expanded.error) {
-				failClosedControl(
-					expanded.error.detail ||
-						'Failed to sync lecture video playback. Please refresh to continue.'
-				);
-				return;
+				return false;
 			}
 
-			applySession(expanded.data.lecture_video_session);
-		} catch (error) {
-			if (controllerSessionId !== interactionControllerSessionId) {
-				return;
+			const refreshedSession = expanded.data.lecture_video_session;
+			if (!refreshedSession) {
+				return false;
 			}
-			failClosedControl(error instanceof Error ? error.message : String(error));
+
+			applySession(refreshedSession);
+			return true;
+		} catch (error) {
+			if (error instanceof DOMException && error.name === 'AbortError') {
+				return false;
+			}
+			return false;
+		} finally {
+			if (playbackSessionRefreshController === refreshController) {
+				playbackSessionRefreshController = null;
+			}
+		}
+	}
+
+	function queuePlaybackInteraction(type: 'video_paused' | 'video_resumed') {
+		if (!controllerSessionId || sessionState !== 'playing') {
+			return;
+		}
+
+		latestPlaybackInteraction = {
+			type,
+			offsetMs: Math.round(currentTimeMs)
+		};
+
+		if (!playbackInteractionInFlight) {
+			void drainPlaybackInteractionQueue();
+		}
+	}
+
+	async function drainPlaybackInteractionQueue() {
+		if (playbackInteractionInFlight) {
+			return;
+		}
+
+		playbackInteractionInFlight = true;
+		try {
+			while (latestPlaybackInteraction) {
+				const interaction = latestPlaybackInteraction;
+				latestPlaybackInteraction = null;
+
+				const interactionControllerSessionId = controllerSessionId;
+				if (!interactionControllerSessionId || sessionState !== 'playing') {
+					// Playback telemetry is only meaningful while video playback is active.
+					// If the session moved into a question/completion state, drop the stale desired state.
+					return;
+				}
+
+				try {
+					const response = await api.postLectureVideoInteraction(fetch, classId, threadId, {
+						type: interaction.type,
+						controller_session_id: interactionControllerSessionId,
+						expected_state_version: stateVersion,
+						idempotency_key: crypto.randomUUID(),
+						offset_ms: interaction.offsetMs
+					});
+					if (controllerSessionId !== interactionControllerSessionId) {
+						return;
+					}
+
+					const expanded = api.expandResponse(response);
+					if (expanded.$status === 409) {
+						const refreshed = await refreshLectureVideoSession(interactionControllerSessionId);
+						if (!refreshed) {
+							if (controllerSessionId !== interactionControllerSessionId) {
+								return;
+							}
+							failClosedControl(
+								'Lecture video state changed and could not be refreshed. Please refresh to continue.'
+							);
+							return;
+						}
+						continue;
+					}
+					if (expanded.error) {
+						failClosedControl(
+							expanded.error.detail ||
+								'Failed to sync lecture video playback. Please refresh to continue.'
+						);
+						return;
+					}
+
+					applySession(expanded.data.lecture_video_session);
+				} catch (error) {
+					if (controllerSessionId !== interactionControllerSessionId) {
+						return;
+					}
+					failClosedControl(error instanceof Error ? error.message : String(error));
+					return;
+				}
+			}
+		} finally {
+			playbackInteractionInFlight = false;
+			if (latestPlaybackInteraction) {
+				// A new desired playback state may arrive while an earlier attempt exits early.
+				// Restart once after releasing the in-flight guard so that latest state is not stranded.
+				void drainPlaybackInteractionQueue();
+			}
 		}
 	}
 
@@ -974,7 +1078,7 @@
 		}
 		if (playbackLocked) return;
 		if (!controllerSessionId || sessionState !== 'playing') return;
-		void postPlaybackInteraction('video_paused');
+		queuePlaybackInteraction('video_paused');
 	}
 
 	function handlePlay() {
@@ -991,7 +1095,7 @@
 			return;
 		}
 		if (!controllerSessionId || sessionState !== 'playing') return;
-		void postPlaybackInteraction('video_resumed');
+		queuePlaybackInteraction('video_resumed');
 	}
 
 	async function handleSeek(toOffsetMs: number, fromOffsetMs: number) {
